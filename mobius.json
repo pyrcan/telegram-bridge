@@ -1,0 +1,56 @@
+{
+  "id": "telegram-bridge",
+  "name": "Telegram Bridge",
+  "version": "0.1.0",
+  "description": "Use your Möbius agent from a private Telegram chat. Add Telegram Bot Studio to build separate bots and optionally manage them through Bridge.",
+  "entry": "index.jsx",
+  "icon": "icon.png",
+  "offline_capable": false,
+  "embeds_agent": true,
+  "permissions": {
+    "job_secret_read": [
+      "bot-token"
+    ]
+  },
+  "schedule": {
+    "default": "* * * * *",
+    "user_configurable": false,
+    "job": "bridge.sh"
+  },
+  "source_files": [
+    "owner-handoff.js",
+    "owner.py",
+    "connect_telegram.py",
+    "telegram_http.py",
+    "bridge.py",
+    "theme.js",
+    "bridge_loop.py",
+    "bridge_progress.py",
+    "bridge_assistants.py",
+    "bridge_connections.py",
+    "bridge_access.py",
+    "bridge_setup.py",
+    "README.md",
+    "LICENSE",
+    "TESTING.md"
+  ],
+  "service": {
+    "id": "telegram-bridge",
+    "entry": "bridge_connections.py",
+    "access": "apps"
+  },
+  "package_id": "urn:uuid:f858f58b-35de-4891-984c-fc8cdcaa1eeb",
+  "author": "pyrcan",
+  "license": "MIT",
+  "store": {
+    "tagline": "Your Möbius agent, in Telegram.",
+    "description": "Pair a private Telegram bot with your Möbius owner account to continue conversations, choose models and open completed work from Telegram. Telegram Bridge works on its own. Add the separate Telegram Bot Studio app to create and manage specialist bots. Pair Bridge first: Studio uses that pairing to verify the owner during setup. Customization opens in Möbius; user management in Telegram requires a separate approval. Direct whole-shell screenshots and continuation of existing Möbius chats from Telegram are not included. Specialist conversations and notes remain separate from the owner channel. Generated images open in Möbius after sign-in rather than being sent to Telegram; set the Möbius address in Bridge for navigation links.",
+    "screenshots": [
+      {
+        "src": "static/store/bridge-core-setup.png",
+        "alt": "Telegram Bridge showing secure bot connection and private account pairing with synthetic setup data.",
+        "label": "Pair your personal channel first"
+      }
+    ]
+  }
+}
