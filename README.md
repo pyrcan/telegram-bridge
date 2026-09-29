@@ -3,10 +3,12 @@
 Your personal Möbius owner agent in a paired private Telegram chat. Telegram
 transport and conversation handling live in this app, not a platform Telegram proxy.
 
-> **Review candidate, not yet a Store-ready platform release.** Requires Möbius
-> support for `permissions.job_secret_read` on supervised app jobs. Older platforms
-> cannot run the job. Submit a Store listing only after that support is released.
-> No custom confirmation capability or service-concurrency change is required.
+> **Platform requirement:** use Möbius with the supervised-job secret permission
+> added in [PR #1565](https://github.com/mobius-os/mobius/pull/1565). It is included
+> in official image revision `928fef19ebabc7023375a748f0c8718831cb5605`
+> (published 29 September 2026), or a later compatible revision. Update Möbius
+> before connecting a bot; older versions cannot run these jobs.
+> No Telegram proxy, new confirmation system or service-concurrency change is required.
 
 ## Two companion apps
 
