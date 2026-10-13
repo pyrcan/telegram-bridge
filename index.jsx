@@ -1,465 +1,134 @@
-import {ownerRequest} from './owner-handoff.js'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import {
-  ArrowRotateCw,
-  ArrowUpRight,
-  Check,
-  Copy,
-  Lock,
-  Plus,
-  ShieldCheck,
-  Trash,
-} from '@openai/apps-sdk-ui/components/Icon'
+import { ArrowRotateCw, ArrowUpRight, Chat, ChevronLeft, ChevronRight, Copy, Grid, Robot, Settings, ShieldCheck } from '@openai/apps-sdk-ui/components/Icon'
 import { CSS } from './theme.js'
+import { useBoundedRequests } from './ui-requests.js'
 
-const DEFAULT_STATUS = {
-  state: 'waiting',
-  label: 'Waiting for setup',
-  detail: 'Add a bot token to begin.',
-  events: [],
+function pairCode() {
+ const bytes=new Uint8Array(12);crypto.getRandomValues(bytes)
+ return Array.from(bytes,b=>'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[b%32]).join('')
 }
+const safeId=v=>typeof v==='string'&&/^[A-Za-z0-9_-]{1,64}$/.test(v)
+const botName=v=>typeof v==='string'&&/^[A-Za-z0-9_]{1,64}$/.test(v)
+const time=v=>v&&!Number.isNaN(new Date(v).getTime())?new Date(v).toLocaleString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'Not checked'
 
-const TELEGRAM_SYSTEM_PROMPT = "This conversation is being used through a text-first Telegram chat. Reply concisely in plain text with simple formatting. When a material choice needs an owner answer, use the platform saved request_question or request_approval card as the final action; the bridge renders its options as Telegram buttons. Do not ask blocking questions only in prose. Do not create widgets, rich proposal previews, or other interface-only artifacts just to communicate; Telegram cannot render them. Use only the tools genuinely needed to complete the request. App-building requests may still use the necessary build and verification tools. Open completed visual work in Möbius. Generated images stay in this Möbius conversation; Bridge sends an authenticated-view link instead of image files. This Store edition has no direct whole-shell screenshot shortcut."
-
-function makePairCode() {
-  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
-  const bytes = new Uint8Array(8)
-  crypto.getRandomValues(bytes)
-  return Array.from(bytes, value => alphabet[value % alphabet.length]).join('')
-}
-
-function prettyTime(value) {
-  if (!value) return 'Not yet'
-  const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? 'Not yet' : date.toLocaleString([], {
-    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
-  })
-}
-
-function stateTone(state) {
-  if (state === 'connected') return 'good'
-  if (state === 'paused' || state === 'waiting' || state === 'needs_token') return 'idle'
-  if (state === 'checking') return 'working'
-  return 'warn'
-}
-
-export default function App({ appId, token }) {
-  const [settings, setSettings] = useState(null)
-  const [pairing, setPairing] = useState(null)
-  const [status, setStatus] = useState(DEFAULT_STATUS)
-  const [hasToken, setHasToken] = useState(false)
-  const [saving, setSaving] = useState(false)
-  const [address, setAddress] = useState('')
-  const [checking, setChecking] = useState(false)
-  const [notice, setNotice] = useState('')
-  const [copyState, setCopyState] = useState('copy')
-  const [chats, setChats] = useState([])
-  const [studio, setStudio] = useState(null)
-  const [studioError, setStudioError] = useState('')
-  const [accessConnection,setAccessConnection]=useState(null)
-  const [connectionBusy, setConnectionBusy] = useState(null)
-  const studioRequest = useRef(null)
-  const [showAllChats,setShowAllChats]=useState(false)
-  const [activeChatId, setActiveChatId] = useState(null)
-  const [creatingChat, setCreatingChat] = useState(false)
-  const [confirmRevoke, setConfirmRevoke] = useState(false)
-  const chatsRequest = useRef(null)
-  const store = window.mobius?.storage
-
-  const loadChats = useCallback(() => {
-    if (chatsRequest.current) return chatsRequest.current
-    chatsRequest.current = (async () => {
-      try {
-        const response = await fetch('/api/app-chats', { headers: { Authorization: `Bearer ${token}` } })
-        if (!response.ok) throw new Error()
-        const value = await response.json()
-        setChats(Array.isArray(value) ? value : [])
-      } catch {
-        setNotice('Could not refresh conversations. Your existing list is still available.')
-      } finally {
-        chatsRequest.current = null
-      }
-    })()
-    return chatsRequest.current
-  }, [token])
-
-  const loadStudio = useCallback(() => {
-    if (studioRequest.current) return studioRequest.current
-    studioRequest.current = (async () => {
-      try {
-        const response = await fetch('/api/services/assistant-studio/owner/catalog', {headers:{Authorization:`Bearer ${token}`}})
-        if (!response.ok) throw new Error('Could not load Studio. Your owner conversation still works.')
-        setStudio(await response.json()); setStudioError('')
-      } catch (error) { setStudioError(error.message) }
-      finally { studioRequest.current = null }
-    })()
-    return studioRequest.current
-  }, [token, appId])
-
-  const accessCurrent=accessConnection?.scope==='owned-bots-v1'&&accessConnection.owner_user_id===Number(pairing?.userId)&&accessConnection.paired_at===pairing?.pairedAt
-  async function changeAccessConnection(disconnect=false) {
-    if (connectionBusy) return
-    setConnectionBusy('access'); setNotice('')
-    try {
-      const context=disconnect?{grant:accessConnection.grant}:{scope:'owned-bots-v1',coverage:'User access and request alerts for current and future bots owned by this paired account',paired_user_id:String(pairing.userId),paired_chat_id:String(pairing.chatId),paired_at:pairing.pairedAt}
-      ownerRequest(appId,'Telegram Bridge',disconnect?'disconnect-access':'connect-access',context)
-      setNotice('Review and send the prepared request in Möbius chat. User management is unchanged until you confirm there.')
-    } catch(error){if(error.name!=='AbortError'&&error.code!=='aborted')setNotice(error.message)}
-    finally{setConnectionBusy(null);await loadStudio()}
-  }
-
-  useEffect(() => {
-    loadStudio()
-    const returned=()=>{if(!document.hidden)loadStudio()}
-    window.addEventListener('focus',returned)
-    document.addEventListener('visibilitychange',returned)
-    return()=>{window.removeEventListener('focus',returned);document.removeEventListener('visibilitychange',returned)}
-  }, [loadStudio])
-
-  useEffect(() => {
-    let alive = true
-    const initial = async () => {
-      try {
-        let next = await store?.get('settings.json')
-        if (!next?.pairingCode) {
-          next = { enabled: true, pairingCode: makePairCode(), createdAt: new Date().toISOString() }
-          await store?.set('settings.json', next)
-        }
-        if (alive) { setSettings(next); setAddress(next.mobiusAddress || '') }
-      } catch {
-        if (alive) setSettings({ enabled: true, pairingCode: makePairCode() })
-      }
-    }
-    // Credential availability is independent of settings and pairing loading.
-    fetch(`/api/apps/${appId}/secrets/bot-token`, {
-      method: 'HEAD', headers: { Authorization: `Bearer ${token}` },
-    }).then(response => { if (alive) setHasToken(response.ok) })
-      .catch(() => { if (alive) setHasToken(false) })
-    initial()
-    const unStatus = store?.subscribe?.('status.json', value => setStatus(value || DEFAULT_STATUS))
-    const unAccess=store?.subscribe?.('owner-access.json',value=>setAccessConnection(value?.scope==='owned-bots-v1'?value:null))
-    const unPair = store?.subscribe?.('pairing.json', value => setPairing(value || null))
-    const unSettings = store?.subscribe?.('settings.json', value => value && setSettings(value))
-    const unConversation = store?.subscribe?.('conversation.json', value => {
-      setActiveChatId(value?.chatId || null)
-      loadChats()
-    })
-    loadChats()
-    return () => { alive = false; unStatus?.(); unPair?.(); unAccess?.(); unSettings?.(); unConversation?.() }
-  }, [appId, token])
-
-  useEffect(() => {
-    if (status.events?.length) loadChats()
-  }, [status.events?.[0]?.at, loadChats])
-
-  const saveSettings = useCallback(async next => {
+export default function App({appId,token}) {
+ const request=useBoundedRequests(appId,token)
+ const [tab,setTab]=useState('chats'),[settingsOpen,setSettingsOpen]=useState(false)
+ const [settings,setSettings]=useState(null),[pairing,setPairing]=useState(null),[status,setStatus]=useState(null)
+ const [keySaved,setKeySaved]=useState(null),[current,setCurrent]=useState(null),[chats,setChats]=useState([])
+ const [studio,setStudio]=useState(null),[studioState,setStudioState]=useState('idle'),[selected,setSelected]=useState(null)
+ const [error,setError]=useState(''),[notice,setNotice]=useState(''),[busy,setBusy]=useState(false)
+ const mounted=useRef(true),refreshing=useRef(null),scroll=useRef(null)
+ const auth={Authorization:`Bearer ${token}`}
+ const read=useCallback(async(path,{optional=false,...options}={})=>{
+  const r=await request(path,{...options,headers:{Authorization:`Bearer ${token}`}})
+  if (optional&&r.status===404)return null
+  if (!r.ok)throw new Error('The request could not be confirmed. Refresh before retrying.')
+  return r.json()
+ },[request,token])
+ const refresh=useCallback(()=>{
+  if(refreshing.current)return refreshing.current
+  refreshing.current=(async()=>{
+   try{
+    const values=await Promise.all(['settings.json','pairing.json','status.json','conversation.json'].map(name=>read(`/api/storage/apps/${appId}/${name}`,{optional:true})))
+    const key=await request(`/api/apps/${appId}/secrets/bot-token`,{method:'HEAD',headers:{Authorization:`Bearer ${token}`}})
+    if(!key.ok&&key.status!==404)throw new Error('Saved-key status unavailable.')
+    const rows=await read('/api/app-chats')
+    if(!Array.isArray(rows)||rows.some(row=>!row||!safeId(row.id)||row.created_by_app_id!==appId||!('pending_question_id' in row)))throw new Error('Conversation metadata unavailable.')
+    if(!mounted.current)return
+    const [saved,pair,health,conversation]=values
+    if(saved!==null&&(typeof saved!=='object'||Array.isArray(saved)||typeof saved.enabled!=='boolean'))throw new Error('Saved settings unavailable.')
+    setSettings(saved);setPairing(pair);setStatus(health);setCurrent(conversation);setChats(rows)
+    setKeySaved(key.ok);setError('')
+   }catch(e){if(e.name!=='AbortError'&&mounted.current)setError('Could not refresh Bridge. Existing metadata is not fresh; no state was changed.')}
+   finally{refreshing.current=null}
+  })();return refreshing.current
+ },[appId,token,read,request])
+ const loadStudio=useCallback(async()=>{
+  setStudioState('loading');setStudio(null)
+  try{
+   const first=await read('/api/services/assistant-studio/owner/catalog')
+   if(first?.navigation_contract!=='owner-metadata-v1'||!Number.isSafeInteger(first?.app_id)||first.app_id<=0)throw new Error()
+   const before=await read(`/api/apps/${first.app_id}`)
+   if(before.id!==first.app_id||before.capability_contract?.service?.id!=='assistant-studio'||!before.frame_version||!before.storage_generation)throw new Error()
+   const value=await read('/api/services/assistant-studio/owner/catalog')
+   const after=await read(`/api/apps/${first.app_id}`)
+   if(value.navigation_contract!=='owner-metadata-v1'||value.app_id!==first.app_id||after.id!==before.id||after.frame_version!==before.frame_version||after.storage_generation!==before.storage_generation||after.capability_contract?.service?.id!=='assistant-studio'||!Array.isArray(value.assistants))throw new Error()
+   const bots=value.assistants.map(b=>{
+    if(!safeId(b?.id)||typeof b.name!=='string'||typeof b.development?.status!=='string')throw new Error()
+    // Explicit content-free projection. Unknown service fields never render.
+    return {id:b.id,name:b.name.slice(0,160),status:b.development.status.slice(0,160),test:b.development.test_label,release:b.development.release_label,username:botName(b.connection?.username)?b.connection.username:null,chat:safeId(b.editing_chat?.id)?b.editing_chat.id:null}
+   })
+   setStudio({app_id:value.app_id,bots});setStudioState('ready')
+  }catch(e){if(e.name!=='AbortError')setStudioState('unavailable')}
+ },[read])
+ useEffect(()=>{
+  mounted.current=true;refresh()
+  const onVisible=v=>{if(v)refresh()}
+  const unsubscribe=window.mobius?.onVisibilityChange?.(onVisible)
+  const timer=setInterval(()=>{if(window.mobius?.visible!==false&&!document.hidden)refresh()},10000)
+  return()=>{mounted.current=false;clearInterval(timer);unsubscribe?.()}
+ },[refresh])
+ useEffect(()=>{if(tab==='bots')loadStudio()},[tab,loadStudio])
+ const navigate=destination=>{setTab(destination);setSettingsOpen(false);setSelected(null);scroll.current?.scrollTo(0,0)}
+ const openChat=id=>window.parent.postMessage({type:'moebius:open-chat',chatId:id},'*')
+ const openStudio=async()=>{
+  // Re-resolve its accepted runtime before navigation; stale cached catalog is
+  // neither authority nor a reason to install another app.
+  if(!studio)return
+  try{const app=await read(`/api/apps/${studio.app_id}`);if(app.id!==studio.app_id||app.capability_contract?.service?.id!=='assistant-studio')throw new Error();window.parent.postMessage({type:'moebius:open-app',appId:studio.app_id},'*')}
+  catch{setStudio(null);setStudioState('unavailable')}
+ }
+ function ownerSetup(){
+  const draft=`Help me securely connect Telegram Bridge (app ${appId}). Read the installed README and inspect this app's accepted job-context runtime. Run its owner.py connect --app-id ${appId} from that accepted runtime in this nondelegated owner chat to save the existing sealed-input form as the final action. Never ask for a key in chat or an app input. Opening this draft is navigation, not approval or execution. Do not start listening, publish, migrate pairing or change other apps.`
+  window.parent.postMessage({type:'moebius:new-chat',draft},'*')
+  setNotice('An editable setup request was opened in Möbius. Send it there to request the secure form; no key was collected here.')
+ }
+ async function updateListening(){
+  if(busy||error)return;setBusy(true);setNotice('')
+  try{
+   const saved=await read(`/api/storage/apps/${appId}/settings.json`,{optional:true})
+   const next=saved?{...saved,enabled:!saved.enabled}:{enabled:true,pairingCode:pairCode()}
+   if(!next.enabled||keySaved===true){
+    await read(`/api/storage/apps/${appId}/settings.json`,{method:'PUT',body:JSON.stringify(next)})
     setSettings(next)
-    try {
-      await store?.set('settings.json', next)
-      return true
-    } catch {
-      setNotice('Could not save that change. Try again while online.')
-      return false
-    }
-  }, [store])
-
-  const saveAddress = async event => {
-    event.preventDefault()
-    let origin = ''
-    if (address.trim()) {
-      try {
-        const url = new URL(address.trim())
-        if (url.protocol !== 'https:' || url.username || url.password || url.pathname !== '/' || url.search || url.hash || /[\\\s]/.test(address.trim()) || /[\x00-\x1f]/.test(address) || url.port === '0') throw new Error()
-        origin = url.origin
-      } catch { setNotice('Use your HTTPS Möbius address only, without a path, password or query.'); return }
-    }
-    if (await saveSettings({...settings, mobiusAddress: origin})) {
-      setAddress(origin)
-      setNotice(origin ? 'Möbius links saved. Images open there after sign-in; no key is sent with the link.' : 'Möbius links turned off. Telegram text replies still work.')
-    }
-  }
-
-  const connectTelegram = async () => {
-    if (saving) return
-    setSaving(true); setNotice('')
-    try {
-      ownerRequest(appId,'Telegram Bridge','connect-telegram',{operation:hasToken?'Replace the saved Bridge key':'Connect a dedicated owner bot'})
-      setNotice('Review and send the request in Möbius chat. Enter the key only in its secure card—not a chat message.')
-    } catch (error) {
-      if (error.name !== 'AbortError' && error.code !== 'aborted') setNotice('Setup was interrupted. Check the saved connection before trying again.')
-    } finally {
-      try {
-        const response = await fetch(`/api/apps/${appId}/secrets/bot-token`, {
-          method: 'HEAD', headers: { Authorization: `Bearer ${token}` },
-        })
-        if (response.ok || response.status === 404) setHasToken(response.ok)
-      } catch { /* Preserve the last known state if the check is offline. */ }
-      setSaving(false)
-    }
-  }
-
-  const runCheck = async () => {
-    if (checking) return
-    setChecking(true)
-    setNotice('Checking the bot…')
-    try {
-      const response = await fetch(`/api/apps/${appId}/service/bot-info`, {
-        headers: { Authorization: `Bearer ${token}` },
-      })
-      if (!response.ok) throw new Error()
-      const result = await response.json()
-      if (!result.is_bot) throw new Error()
-      setNotice(`Bot connection verified${result.username ? `: @${result.username}` : ''}.`)
-    } catch {
-      setNotice('Could not verify the bot connection. Check the saved token and try again.')
-    } finally {
-      setChecking(false)
-    }
-  }
-
-  const toggleEnabled = async () => {
-    if (!settings) return
-    const previous = settings
-    const enabled = !settings.enabled
-    if (await saveSettings({ ...settings, enabled })) {
-      setNotice(enabled ? 'Starting the bridge…' : 'Bridge paused. An already-running reply may finish.')
-      if (enabled) {
-        try {
-          const response = await fetch(`/api/apps/${appId}/run-job`, {
-            method: 'POST', headers: { Authorization: `Bearer ${token}` },
-          })
-          if (!response.ok) throw new Error()
-          setNotice('Resume requested. Connection status updates automatically.')
-        } catch {
-          setNotice('Resume saved. The scheduled bridge will pick it up shortly.')
-        }
-      }
-    } else {
-      setSettings(previous)
-    }
-  }
-
-  const copyCode = async () => {
-    try {
-      await navigator.clipboard.writeText(`/pair ${settings.pairingCode}`)
-      setCopyState('done')
-      setTimeout(() => setCopyState('copy'), 1800)
-    } catch {
-      setNotice(`Send /pair ${settings.pairingCode} to your bot.`)
-    }
-  }
-
-  const resetPairing = async () => {
-    if (!confirmRevoke) {
-      setConfirmRevoke(true)
-      setNotice('Tap “Confirm revoke” to disconnect this Telegram chat.')
-      return
-    }
-    const next = { ...settings, pairingCode: makePairCode() }
-    try {
-      await Promise.all([
-        store?.remove('pairing.json'),
-        store?.remove('conversation.json'),
-        store?.set('settings.json', next),
-      ])
-      setPairing(null)
-      setSettings(next)
-      setConfirmRevoke(false)
-      setNotice('Telegram access revoked. A new pairing code is ready.')
-    } catch {
-      setNotice('Could not reset pairing. Try again while online.')
-    }
-  }
-
-  const createConversation = async () => {
-    if (!pairing || creatingChat) return
-    setCreatingChat(true)
-    setNotice('Starting a fresh Telegram conversation…')
-    try {
-      const stamp = new Date().toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
-      const response = await fetch('/api/app-chats', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          title: `Telegram · ${pairing.displayName || 'Private chat'} · ${stamp}`,
-          scope: `telegram:${pairing.chatId}`,
-          scope_label: pairing.displayName || 'Telegram',
-          owner_visible: true,
-          system_prompt: TELEGRAM_SYSTEM_PROMPT,
-        }),
-      })
-      if (!response.ok) throw new Error()
-      const created = await response.json()
-      await store?.set('conversation.json', { chatId: created.id, createdAt: new Date().toISOString() })
-      setActiveChatId(created.id)
-      setNotice('Fresh conversation ready in Möbius and Telegram.')
-      await loadChats()
-    } catch {
-      setNotice('Could not create the conversation. Try again while online.')
-    } finally {
-      setCreatingChat(false)
-    }
-  }
-
-  const openConversation = chatId => {
-    window.parent.postMessage({ type: 'moebius:open-chat', chatId }, '*')
-  }
-
-  const displayChatTitle = chat => {
-    const title = String(chat.title || '').trim()
-    if (title && !title.startsWith('[Telegram bridge note:')) return title
-    return `Telegram · ${chat.scope_label || pairing?.displayName || 'Conversation'}`
-  }
-
-  const botUsername = String(status.botUsername || '').replace(/^@/, '')
-  const pairLink = botUsername && settings?.pairingCode
-    ? `https://t.me/${botUsername}?start=${encodeURIComponent(settings.pairingCode)}`
-    : ''
-
-  if (!settings) return <div className="tg-root"><style>{CSS}</style><div className="tg-loading">Preparing your bridge…</div></div>
-
-  const tone = stateTone(status.state)
-  const setupPanel = (
-        <details className="tg-settings" open={!hasToken||!pairing}><summary>{!hasToken||!pairing?'Finish setup':'Settings · connection, pairing & diagnostics'}</summary>
-        <section className="tg-grid">
-          <div className="tg-main-card">
-            <div className="tg-section-head">
-              <div><span className="tg-step">1</span><h2>Connect your bot</h2></div>
-              <a href="https://t.me/BotFather" target="_blank" rel="noreferrer">Open BotFather <ArrowUpRight size={15} /></a>
-            </div>
-            <p className="tg-help">Create a dedicated bot with BotFather, then continue in Möbius chat for a secure key card. The key bypasses this app screen and is encrypted locally.</p>
-            {hasToken ? (
-              <div className="tg-token-saved">
-                <div className="tg-token-badge"><Check size={17} /><span><strong>Token stored</strong><small>{botUsername ? `Connected as @${botUsername}` : 'Ready for a connection check'}</small></span></div>
-                <div className="tg-token-actions">
-                  <button className="tg-text-btn" onClick={connectTelegram} disabled={saving}>{saving ? 'Opening…' : 'Replace key'}</button>
-                  <button className="tg-text-btn" onClick={runCheck} disabled={checking}><ArrowRotateCw size={15} />{checking ? 'Checking…' : 'Check now'}</button>
-                </div>
-              </div>
-            ) : (
-              <button className="tg-primary" onClick={connectTelegram} disabled={saving}><Lock size={17} />{saving ? 'Opening secure setup…' : 'Connect securely'}</button>
-            )}
-
-            <div className="tg-divider" />
-
-            <div className="tg-section-head">
-              <div><span className="tg-step">2</span><h2>Pair one private chat</h2></div>
-            </div>
-            {pairing ? (
-              <div className="tg-paired">
-                <div className="tg-avatar">{(pairing.displayName || 'T').slice(0, 1).toUpperCase()}</div>
-                <div><strong>{pairing.displayName || 'Telegram user'}</strong><span>{pairing.username ? `@${pairing.username}` : 'Private chat'} · paired {prettyTime(pairing.pairedAt)}</span></div>
-                <div className="tg-paired-actions">
-                  {botUsername && <a className="tg-open-bot" href={`https://t.me/${botUsername}`} target="_blank" rel="noreferrer">Open bot <ArrowUpRight size={14} /></a>}
-                  <button className={`tg-danger ${confirmRevoke ? 'is-confirming' : ''}`} onClick={resetPairing}><Trash size={15} /> {confirmRevoke ? 'Confirm revoke' : 'Revoke'}</button>
-                  {confirmRevoke && <button className="tg-cancel-revoke" onClick={() => { setConfirmRevoke(false); setNotice('') }}>Cancel</button>}
-                </div>
-              </div>
-            ) : (
-              <div className="tg-pair-box">
-                {pairLink && <a className="tg-pair-link" href={pairLink} target="_blank" rel="noreferrer">Open @{botUsername} and pair <ArrowUpRight size={16} /></a>}
-                <p>{pairLink ? 'Or send this command manually:' : 'Open your bot in Telegram and send:'}</p>
-                <button className="tg-code" onClick={copyCode}><code>/pair {settings.pairingCode}</code>{copyState === 'done' ? <Check size={18} /> : <Copy size={18} />}</button>
-                <small>{pairLink ? 'Telegram passes the one-time code securely when you tap Start.' : 'Run a connection check to enable one-tap pairing.'} Only the first private chat is accepted.</small>
-              </div>
-            )}
-            <div className="tg-divider" />
-            <form onSubmit={saveAddress} className="tg-address">
-              <label htmlFor="mobius-address">Möbius address</label>
-              <p className="tg-help">Images stay in Möbius. Add its HTTPS address for open-in-Möbius buttons in Telegram. Links contain no sign-in key.</p>
-              <input id="mobius-address" type="url" value={address} onChange={event=>setAddress(event.target.value)} placeholder="https://your-mobius.example" autoComplete="url" />
-              <button className="tg-secondary" type="submit">Save address</button>
-            </form>
-          </div>
-
-          <aside className="tg-side-card">
-            <div className="tg-side-top"><div><span>Bridge status</span><h2>{status.label || DEFAULT_STATUS.label}</h2></div><div className={`tg-status-dot tg-${tone}`} /></div>
-            <p>{status.detail || DEFAULT_STATUS.detail}</p>
-            <dl>
-              <div><dt>Bot</dt><dd>{status.botUsername ? `@${status.botUsername}` : 'Not checked'}</dd></div>
-              <div><dt>Last check</dt><dd>{prettyTime(status.checkedAt)}</dd></div>
-              <div><dt>Delivery</dt><dd>Text + Möbius links</dd></div>
-            </dl>
-            <button className={`tg-toggle ${settings.enabled ? 'is-on' : ''}`} onClick={toggleEnabled}><span><i />{settings.enabled ? 'Bridge on' : 'Bridge paused'}</span><b>{settings.enabled ? 'Pause' : 'Resume'}</b></button>
-            <div className="tg-activity">
-              <h3>Recent activity</h3>
-              {(status.events || []).length ? status.events.slice(0, 5).map((item, index) => (
-                <div className="tg-event" key={`${item.at}-${index}`}><i className={`is-${item.tone || 'neutral'}`} /><span>{item.label}</span><time>{prettyTime(item.at)}</time></div>
-              )) : <div className="tg-empty">Activity appears after the first check.</div>}
-            </div>
-          </aside>
-        </section>
-
-        </details>
-  )
-  return (
-    <div className="tg-root">
-      <style>{CSS}</style>
-      <main className="tg-wrap">
-        <section className="tg-hero">
-          <div className="tg-hero-copy">
-            <div className="tg-eyebrow"><ShieldCheck size={16} /> Owner remote</div>
-            <h1>Telegram Bridge</h1>
-            <p>Build and manage through your owner bot. Use each specialist in its own Telegram chat.</p>
-          </div>
-        </section>
-
-        {notice && <div className="tg-notice" role="status">{notice}</div>}
-
-        {!pairing && setupPanel}
-        {pairing&&<section className="tg-main-card"><div className="tg-section-head"><div><h2>{settings.enabled?(status.label||'Checking connection'):'Paused'}</h2></div>{botUsername&&<a className="tg-primary" href={`https://t.me/${botUsername}`} target="_blank" rel="noreferrer">Open Telegram <ArrowUpRight size={16}/></a>}</div><p className="tg-help">{chats.find(c=>c.id===activeChatId)?`Current chat: ${displayChatTitle(chats.find(c=>c.id===activeChatId))}`:'Send a message in Telegram to continue.'}</p></section>}
-        <section className="tg-main-card tg-user-management" aria-label="Telegram user management">
-          <div className="tg-section-head"><div><h2>User management in Telegram</h2></div></div>
-          <p className="tg-help">{accessCurrent?'Connected for your current and future bots. In Telegram, open My bots → choose a bot → Users. Approve requests and control alerts there.':'Connect once, then manage users and request alerts for your current and future bots directly in your owner Telegram chat. Private conversations and notes stay hidden.'}</p>
-          <button className="tg-primary" disabled={!pairing||!!connectionBusy} onClick={()=>changeAccessConnection(!!accessCurrent)}>{connectionBusy==='access'?'Opening…':accessCurrent?'Disconnect user management':accessConnection?'Reconnect user management':'Enable user management'}</button>
-          {!pairing&&<p className="tg-help">Pair your owner Telegram chat first.</p>}
-          {accessConnection&&!accessCurrent&&<button className="tg-text-btn" disabled={!!connectionBusy} onClick={()=>changeAccessConnection(true)}>Disconnect old connection</button>}
-        </section>
-        <details className="tg-conversations" onToggle={event=>{if(event.currentTarget.open)loadStudio()}}><summary>Your bots{studio?` · ${studio.assistants.length}`:''}</summary>
-          <div className="tg-conversation-head"><div><h2>Build in one place</h2><p>Telegram Bot Studio is a separate, optional app for building bots. Open customization in Möbius; user management in Telegram needs its own approval. Private user conversations are not shown.</p></div>{studio&&<button className="tg-secondary" onClick={()=>window.parent.postMessage({type:'moebius:open-app',appId:studio.app_id},'*')}>Open Studio <ArrowUpRight size={15}/></button>}</div>
-          {studioError?<p className="tg-notice" role="alert">{studioError} <button className="tg-text-btn" onClick={loadStudio}>Try again</button></p>:!studio?<p>Loading bots…</p>:studio.assistants.length===0?<p>No bots yet. Create your first one in Studio.</p>:<div className="tg-conversation-list">{studio.assistants.map(bot=>{
-            return <div className="tg-bot-entry" key={bot.id}>
-              <button className="tg-conversation-row tg-bot-row" onClick={()=>bot.editing_chat?.id?openConversation(bot.editing_chat.id):window.parent.postMessage({type:'moebius:open-app',appId:studio.app_id},'*')}><div className="tg-chat-copy"><strong>{bot.name}</strong><span>{bot.development.status} · {bot.development.release_label}</span></div><span className="tg-open-chat">{bot.editing_chat?.id?'Customize':bot.connection?.username?'Customize in Studio':'Set up in Studio'} <ArrowUpRight size={15}/></span></button>
-            </div>
-          })}</div>}
-        </details>
-        <details className="tg-conversations"><summary>Conversations · {chats.length}</summary>
-          <div className="tg-conversation-head">
-            <div>
-              <span>Telegram conversations</span>
-              <h2>Your chats</h2>
-              <p>Continue a conversation here. In Telegram, use Chats or My bots.</p>
-            </div>
-            <button className="tg-primary tg-new-chat" onClick={createConversation} disabled={!pairing || creatingChat}>
-              <Plus size={16} />{creatingChat ? 'Starting…' : 'New conversation'}
-            </button>
-          </div>
-          <div className="tg-conversation-list">
-            {chats.length ? (showAllChats?chats:chats.slice(0,3)).map(chat => (
-              <button className="tg-conversation-row" key={chat.id} onClick={() => openConversation(chat.id)}>
-                <div className="tg-chat-mark">TG</div>
-                <div className="tg-chat-copy">
-                  <strong>{displayChatTitle(chat)}</strong>
-                  <span>{chat.pending_question_id ? 'Waiting for your answer' : (chat.has_messages ? 'Conversation in progress' : 'Ready for its first message')} · {prettyTime(chat.activity_at || chat.created_at)}</span>
-                </div>
-                {chat.pending_question_id
-                  ? <em className="is-question">Question</em>
-                  : (chat.id === activeChatId && <em>Current</em>)}
-                <span className="tg-open-chat">Open <ArrowUpRight size={15} /></span>
-              </button>
-            )) : (
-              <div className="tg-conversation-empty">
-                <div className="tg-chat-mark">TG</div>
-                <div><strong>No conversations yet</strong><span>Send a message to your bot or start one here.</span></div>
-              </div>
-            )}
-          </div>
-          {chats.length>3&&<button className="tg-text-btn" onClick={()=>setShowAllChats(v=>!v)}>{showAllChats?'Show recent chats':`Show all ${chats.length} chats`}</button>}
-        </details>
-
-        {pairing && setupPanel}
-        <footer><ShieldCheck size={15} /> Your personal owner channel. Specialist users have separate bots and private data.</footer>
-      </main>
-    </div>
-  )
+    if(next.enabled)await read(`/api/apps/${appId}/run-job`,{method:'POST',body:'{}'})
+    setNotice(next.enabled?'Listening requested. Check the saved status below; cron owns the listener.':'Paused. Accepted work or an in-flight reply may still finish.')
+   }else setNotice('Save the dedicated bot key securely before enabling listening.')
+  }catch{setNotice('The listening change could not be confirmed. Refresh status before trying again; it was not retried.')}
+  finally{setBusy(false);await refresh()}
+ }
+ async function preparePairing(){
+  if(busy||pairing||error)return;setBusy(true)
+  try{
+   const saved=await read(`/api/storage/apps/${appId}/settings.json`,{optional:true})
+   if(!saved?.pairingCode){const next={...(saved||{}),enabled:saved?.enabled===true,pairingCode:pairCode()};await read(`/api/storage/apps/${appId}/settings.json`,{method:'PUT',body:JSON.stringify(next)});setSettings(next)}
+  }catch{setNotice('The code was not confirmed. Refresh saved status before retrying.')}
+  finally{setBusy(false);await refresh()}
+ }
+ const username=botName(status?.botUsername)?status.botUsername:null
+ const personal=chats.filter(c=>pairing&&c.scope===`telegram:${pairing.chatId}`)
+ const active=personal.find(c=>c.id===current?.chatId)
+ const chosen=studio?.bots.find(b=>b.id===selected)
+ return <div className="tg-root"><style>{CSS}</style>
+  <header className="tg-header"><h1>Bridge</h1><button className="tg-icon-btn" aria-label="Settings" aria-expanded={settingsOpen} onClick={()=>setSettingsOpen(!settingsOpen)}><Settings width={22} height={22}/></button></header>
+  <main className="tg-scroll" ref={scroll}><div className="tg-page">
+   {error&&<div className="tg-notice" role="alert">{error}<button className="tg-text-btn" onClick={refresh}><ArrowRotateCw width={16} height={16}/>Refresh</button></div>}
+   {notice&&<div className="tg-notice" role="status">{notice}</div>}
+   {settingsOpen?<section aria-label="Connection settings">
+    <button className="tg-back" onClick={()=>setSettingsOpen(false)}><ChevronLeft width={17} height={17}/>Back to {tab}</button><h2 className="tg-view-title">Settings</h2>
+    <section className="tg-main-card"><h3>Dedicated bot key</h3><p className="tg-help">{keySaved===null?'Saved-key status not checked.':keySaved?'An encrypted bot key is saved. Its value never reaches this frame.':'Create your personal bot with BotFather, then use the secure form in your Möbius owner chat.'}</p><button className="tg-primary" onClick={ownerSetup}>{keySaved?'Review secure setup':'Set up securely in Möbius'}</button><p className="tg-quiet-note">This opens an editable request, not a key input or approval. A different bot is never substituted into this installation.</p></section>
+    <section className="tg-main-card"><h3>One private owner</h3>{pairing?<><p className="tg-help">{pairing.displayName||'Private owner'} · paired {time(pairing.pairedAt)}</p><p className="tg-quiet-note">Groups and other Telegram accounts are ignored. Pairing revocation and replacement require review in your Möbius owner chat.</p></>:<><p className="tg-help">Prepare a one-time pairing code, enable listening after secure setup, then send the code to your personal bot.</p>{settings?.pairingCode?<button className="tg-code" onClick={async()=>{try{await navigator.clipboard.writeText(`/pair ${settings.pairingCode}`);setNotice('Pairing command copied.')}catch{setNotice('Copy is unavailable. Enter the visible pairing command manually.')}}}><code>/pair {settings.pairingCode}</code><Copy width={18} height={18}/></button>:<button className="tg-secondary" disabled={busy||!!error} onClick={preparePairing}>Prepare pairing code</button>}{username&&settings?.pairingCode&&<a className="tg-primary tg-studio-link" href={`https://t.me/${username}?start=${settings.pairingCode}`} target="_blank" rel="noreferrer">Open bot to pair <ArrowUpRight width={16} height={16}/></a>}</>}
+    </section><section className="tg-main-card"><h3>{status?.label||'Waiting for setup'}</h3><p className="tg-help">{status?.detail||'Save the key securely before enabling listening.'}</p><p className="tg-quiet-note">Last check: {time(status?.checkedAt)}. Enabling accepts paired-owner text; configured provider usage may be incurred. Pause prevents future intake, not already accepted work.</p><button className="tg-secondary" disabled={busy||!!error||(!settings?.enabled&&keySaved!==true)} onClick={updateListening}>{busy?'Checking…':settings?.enabled?'Pause Bridge':'Enable listening'}</button></section>
+   </section>:tab==='chats'?<section aria-label="Chats"><h2 className="tg-view-title">Chats</h2>
+    <div className="tg-connection-alert"><span>{status?.label||'Setup needed'} · {pairing?'Private owner paired':'Not paired'}</span><button className="tg-text-btn" onClick={()=>setSettingsOpen(true)}>Settings</button></div>
+    {active?<button className="tg-current-card" onClick={()=>openChat(active.id)}><div><span className="tg-section-label">Current in Telegram</span><h3>{active.title||'Personal conversation'}</h3><p>{active.pending_question_id?'Waiting for your answer':active.running?'Working':'Ready to continue'}</p></div><ArrowUpRight width={20} height={20}/></button>:<div className="tg-current-empty"><strong>Your personal conversations</strong><p className="tg-help">Send a message to your paired Telegram bot to begin. Use /new for a fresh conversation and /chats to choose where to continue.</p><button className="tg-text-btn" onClick={()=>setSettingsOpen(true)}>Review connection</button></div>}
+    <h3 className="tg-section-label">Saved conversations · metadata only</h3>
+    {personal.length?personal.map(c=><button className="tg-list-row" key={c.id} onClick={()=>openChat(c.id)}><Chat width={22} height={22}/><div className="tg-chat-copy"><strong>{c.title||'Personal conversation'}</strong><span>{c.pending_question_id?'Waiting for your answer':c.running?'Working':'Saved'} · {time(c.activity_at||c.updated_at||c.created_at)}</span></div><ArrowUpRight width={18} height={18}/></button>):<p className="tg-help">No personal conversations are available yet.</p>}
+    <p className="tg-quiet-note">Opening a conversation here does not switch Telegram routing. Archive state and transcript previews are not exposed by this edition; filing stays in Möbius.</p>
+   </section>:tab==='bots'?<section aria-label="Bots">
+    {chosen?<><button className="tg-back" onClick={()=>setSelected(null)}><ChevronLeft width={17} height={17}/>Your bots</button><div className="tg-detail-icon"><Robot width={28} height={28}/></div><h2 className="tg-view-title">{chosen.name}</h2><p className="tg-help">{chosen.status}</p><dl className="tg-bot-facts"><div><dt>Your test</dt><dd>{chosen.test||'Review in Studio'}</dd></div><div><dt>Published</dt><dd>{chosen.release||'Review in Studio'}</dd></div></dl><div className="tg-button-stack">{chosen.chat&&<button className="tg-secondary" onClick={()=>openChat(chosen.chat)}>Customize in Möbius <ArrowUpRight width={16} height={16}/></button>}{chosen.username&&<a className="tg-primary" href={`https://t.me/${chosen.username}`} target="_blank" rel="noreferrer">Open bot</a>}<button className="tg-secondary" onClick={openStudio}>Open Studio</button></div><p className="tg-quiet-note">Navigation is not a Telegram continuation grant. Publishing, private tests and user access remain in Studio.</p></>:<><h2 className="tg-view-title">Bots</h2><p className="tg-help">Optional Telegram Bot Studio shortcuts. Only owner configuration metadata, never participant notes or conversations.</p>{studioState==='loading'?<p className="tg-help">Checking the current Studio runtime…</p>:studioState==='ready'?<>{studio.bots.length?studio.bots.map(b=><button className="tg-list-row tg-bot-row" key={b.id} onClick={()=>setSelected(b.id)}><Robot width={22} height={22}/><div className="tg-chat-copy"><strong>{b.name}</strong><span>{b.status}</span></div><ChevronRight width={18} height={18}/></button>):<p className="tg-help">No bots yet. Create one in Studio.</p>}<button className="tg-secondary tg-studio-link" onClick={openStudio}>Open Studio <ArrowUpRight width={16} height={16}/></button></>:<div className="tg-studio-empty"><h3>Studio is optional</h3><p className="tg-help">Its metadata is unavailable, not authorized, or its runtime does not match. Bridge works on its own. Installing or linking an app grants no access.</p><button className="tg-secondary" onClick={loadStudio}>Check again</button></div>}</>}
+   </section>:<section aria-label="Tools"><h2 className="tg-view-title">Tools</h2><button className="tg-list-row" onClick={()=>setSettingsOpen(true)}><Settings width={22} height={22}/><div className="tg-chat-copy"><strong>Personal connection</strong><span>Secure setup, pairing and listening</span></div><ChevronRight width={18} height={18}/></button><button className="tg-list-row" onClick={refresh}><ArrowRotateCw width={22} height={22}/><div className="tg-chat-copy"><strong>Refresh saved status</strong><span>Reads only; no Telegram test or model call</span></div></button><section className="tg-main-card"><ShieldCheck width={24} height={24}/><h3>Public-core edition</h3><p className="tg-help">Private text, menus, model choice, progress and Bridge-owned conversation routing. Ordinary saved cards retain exact identities; their Telegram answers are agent-scoped, not trusted owner permission.</p><p className="tg-quiet-note">Mini App, screenshots, media transport, exact customization-chat connections, filing, deletion and Telegram user management are not included. Sensitive actions and credentials stay in Möbius.</p><p className="tg-quiet-note">The reviewed background job can read its own encrypted key into RAM solely for the Telegram API. This frame never receives it. Telegram and configured model providers process their respective requests; hosting operators control the machine.</p><p className="tg-quiet-note">Uncertain external delivery is never automatically repeated. Lost completed-result streams link to Möbius rather than read transcripts or rerun work.</p></section></section>}
+  </div></main><nav className="tg-bottom-nav" aria-label="Bridge sections">{[['chats','Chats',Chat],['bots','Bots',Robot],['tools','Tools',Grid]].map(([id,label,Icon])=><button className="tg-nav-btn" key={id} aria-current={!settingsOpen&&tab===id?'page':undefined} onClick={()=>navigate(id)}><Icon width={22} height={22}/><span>{label}</span></button>)}</nav>
+ </div>
 }

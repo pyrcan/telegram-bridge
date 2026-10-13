@@ -1,124 +1,109 @@
 #!/usr/bin/env python3
-"""Scoped Telegram long-poll bridge for one Möbius app.
+"""Public-core edition: one paired private owner; app-scoped job auth only.
 
-The supervised job reads only its declared bot key and handles Telegram here.
-The browser never receives the key or raw Telegram responses.
+A reviewed job_secret_read grant permits this job to hold its own bot key in
+RAM for fixed-origin Telegram requests. No frame, model, or response gets it.
 """
-
 from __future__ import annotations
-
-import hmac
-import json
-import os
-import re
-import secrets
-import sys
-import threading
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
-import uuid
+import hashlib, hmac, json, os, re, secrets, sys, threading, time, urllib.error, urllib.parse, urllib.request, uuid
 from types import SimpleNamespace
-from bridge_loop import run_listener
+from datetime import UTC, datetime
+from contextlib import contextmanager
+from bridge_loop import run_listener, contains_bot_key
 from bridge_progress import ReplyProgress
 import bridge_assistants
-import bridge_access
-import telegram_http
-from datetime import UTC, datetime
-
+from telegram_http import TelegramHTTP, TelegramError, NoRedirect, bot_identity, safe_origin
 
 APP_ID = int(sys.argv[1])
 APP_TOKEN = os.environ["APP_TOKEN"]
 API_BASE = os.environ.get("API_BASE_URL", "http://localhost:8000").rstrip("/")
 AUTH = {"Authorization": f"Bearer {APP_TOKEN}"}
-# Keep listening across cron ticks. The supervisor owns the single-flight lock;
-# this bounded session renews well inside its two-hour app credential lifetime.
 RUN_SECONDS = 30 * 60
 MAINTENANCE_SECONDS = 60
 AGENT_TIMEOUT = 12 * 60
-BOT_COMMANDS_VERSION = 5
-SETUP_COMMANDS = [
-  {"command": "start", "description": "Pair or show help"},
-  {"command": "pair", "description": "Pair this private chat"},
-  {"command": "help", "description": "Show available commands"},
-]
-PAIRED_COMMANDS = [
-  {"command":"chats","description":"Chats"},
-  {"command":"bots","description":"My bots"},
-  {"command":"settings","description":"Settings"},
-  {"command":"help","description":"Home"},
-]
-TELEGRAM_SYSTEM_PROMPT = (
-  "This conversation is being used through a text-first Telegram chat. "
-  "Reply concisely in plain text with simple formatting. When a material "
-  "choice needs an owner answer, use the platform saved request_question or "
-  "request_approval card as the final action; the bridge renders its options as "
-  "Telegram buttons. Do not ask blocking questions only in prose. Do not create widgets, rich "
-  "proposal previews, or other interface-only artifacts just to communicate; "
-  "Telegram cannot render them. Use only the tools genuinely needed to "
-  "complete the request. App-building requests may still use the necessary "
-  "build and verification tools. Open completed visual work in Möbius. "
-  "Generated images stay in this Möbius conversation; Bridge sends an authenticated-view link instead of image files. This Store edition has no direct whole-shell screenshot shortcut."
-)
 QUESTION_STATE_PATH = "telegram-question.json"
 MODEL_STATE_PATH = "model.json"
-PROVIDER_LABELS = {
-  "mobius": "Möbius",
-  "claude": "Claude",
-  "codex": "Codex",
-}
-
+PROVIDER_LABELS = {"mobius":"Möbius", "claude":"Claude", "codex":"Codex"}
+TELEGRAM_SYSTEM_PROMPT = (
+ "This is a private text-first Telegram conversation owned by Telegram Bridge. "
+ "Reply concisely in plain text. Saved ordinary question cards can be answered "
+ "here as agent-scoped input, NEVER as trusted owner permission. Privileged "
+ "approval, secure input, setup and rich/media artifacts must be completed "
+ "in Möbius. Do not request credentials in Telegram or paste transcripts. "
+ "No screenshot or private media transport is provided by this edition."
+)
+_status_lock = threading.RLock()
+_inbox_lock = threading.RLock()
+_outbox_lock = threading.RLock()
+_update_context = threading.local()
+_model_cache = None
+_model_cache_at = 0.0
+_model_cache_lock = threading.Lock()
+_transport = None
 
 class BridgeError(RuntimeError):
-  def __init__(self, message: str, *, status: int | None = None, reason: str = ""):
-    super().__init__(message)
-    self.status = status
-    self.reason = reason
+ def __init__(self, message="Bridge request could not be completed.", *, status=None, reason=""):
+  super().__init__(message); self.status=status; self.reason=reason
 
+@contextmanager
+def inbox_lease():
+ with _inbox_lock: yield
+
+
+def request_json(path, *, method="GET", body=None, timeout=20, headers=None, response_headers=None):
+ if not isinstance(path,str) or not path.startswith('/api/') or '?' in path or '#' in path:
+  raise BridgeError('Invalid Möbius route.')
+ data=json.dumps(body,ensure_ascii=False,allow_nan=False).encode() if body is not None else None
+ req=urllib.request.Request(API_BASE+path,data=data,method=method,headers={**AUTH,**(headers or {}),'Content-Type':'application/json'})
+ try:
+  opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect())
+  with opener.open(req,timeout=timeout) as response:
+   raw=response.read(4*1024*1024+1)
+   if len(raw)>4*1024*1024: raise BridgeError('Möbius response exceeded its bound.')
+   if response_headers is not None:response_headers['ETag']=response.headers.get('ETag')
+   return json.loads(raw) if raw else {}
+ except urllib.error.HTTPError as exc:
+  # Never surface upstream bodies, URLs, content, or credentials.
+  raise BridgeError(f'Möbius request could not be completed ({exc.code}).',status=exc.code) from None
+ except (OSError,ValueError):raise BridgeError('Möbius is temporarily unavailable.') from None
+
+
+def telegram(method, params=None):
+ global _transport
+ if _transport is None: _transport=TelegramHTTP(APP_ID,APP_TOKEN,API_BASE)
+ # A job-bound RAM key; no service/frame route exports the transport.
+ try:
+  update=getattr(_update_context,'update',None)
+  if method=='sendMessage' and isinstance(update,dict):
+   # Durable before send. A lost response is not permission to resend.
+   receipt_key=hashlib.sha256(json.dumps([update.get('update_id'),method,params],sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+   with _outbox_lock:
+    receipts=storage_get('telegram-outbox.json') or {}
+    old=receipts.get(receipt_key)
+    if old:
+     if old.get('state')=='sent':return {'message_id':old['message_id']}
+     raise BridgeError('Telegram delivery is uncertain; no automatic resend. Open Möbius to check the result.')
+    if len(receipts)>=2000:raise BridgeError('Delivery receipt limit reached. Pause Bridge and review in Möbius.')
+    receipts[receipt_key]={'state':'uncertain','at':now()}
+    storage_put('telegram-outbox.json',receipts)
+   result=_transport.call(method,params)
+   if not isinstance(result,dict) or type(result.get('message_id')) is not int:raise TelegramError(reason='invalid-response')
+   with _outbox_lock:
+    receipts=storage_get('telegram-outbox.json') or {}
+    receipts[receipt_key]={'state':'sent','at':now(),'message_id':result['message_id']}
+    storage_put('telegram-outbox.json',receipts)
+   return result
+  return _transport.call(method,params)
+ except TelegramError as exc:
+  raise BridgeError('Telegram request could not be completed.',status=exc.code or None,reason=exc.reason) from None
 
 def now() -> str:
   return datetime.now(UTC).isoformat()
 
 
-def request_json(
-  path: str,
-  *,
-  method: str = "GET",
-  body: object | None = None,
-  timeout: float = 20,
-  headers: dict[str, str] | None = None,
-) -> object:
-  data = None
-  merged = dict(AUTH)
-  if headers:
-    merged.update(headers)
-  if body is not None:
-    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    merged["Content-Type"] = "application/json"
-  req = urllib.request.Request(
-    API_BASE + path, data=data, method=method, headers=merged,
-  )
+def storage_get(path: str, *, response_headers=None) -> object | None:
   try:
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-      raw = response.read()
-      if not raw:
-        return {}
-      return json.loads(raw)
-  except urllib.error.HTTPError as exc:
-    try:
-      payload = json.loads(exc.read())
-      detail = payload.get("detail") if isinstance(payload, dict) else None
-    except Exception:
-      detail = None
-    raise BridgeError(str(detail or f"Möbius request failed ({exc.code})"), status=exc.code)
-  except (OSError, ValueError) as exc:
-    raise BridgeError("Möbius is temporarily unavailable") from exc
-
-
-def storage_get(path: str) -> object | None:
-  try:
-    return request_json(f"/api/storage/apps/{APP_ID}/{path}")
+    return request_json(f"/api/storage/apps/{APP_ID}/{path}", **({'response_headers': response_headers} if response_headers is not None else {}))
   except BridgeError as exc:
     if exc.status == 404:
       return None
@@ -154,17 +139,6 @@ def clear_question_state() -> None:
   storage_put(QUESTION_STATE_PATH, None)
 
 
-def telegram(method: str, params: dict[str, object] | None = None) -> object:
-  try:
-    return telegram_http.call_saved('bot-token', method, params,
-      app_id=APP_ID, bearer=APP_TOKEN, api_base=API_BASE)
-  except telegram_http.TelegramError as exc:
-    raise BridgeError(str(exc), status=exc.code or None, reason=exc.reason) from None
-
-
-_status_lock = threading.RLock()
-
-
 def activity(label: str, tone: str = "neutral") -> None:
   with _status_lock:
     status = storage_get("status.json") or {}
@@ -175,6 +149,7 @@ def activity(label: str, tone: str = "neutral") -> None:
       status = {}
     status["events"] = events
     storage_put("status.json", status)
+
 
 def set_status(state: str, label: str, detail: str, **extra: object) -> None:
   with _status_lock:
@@ -190,12 +165,14 @@ def set_status(state: str, label: str, detail: str, **extra: object) -> None:
     }
     storage_put("status.json", value)
 
+
 def send_text(
   chat_id: int,
   text: str,
   *,
   reply_markup: dict | None = None,
   reply_to_message_id: int | None = None,
+  disable_link_preview: bool = False,
 ) -> dict | None:
   clean = str(text or "").strip()
   if not clean:
@@ -215,6 +192,8 @@ def send_text(
   sent = None
   for index, chunk in enumerate(chunks):
     params: dict[str, object] = {"chat_id": chat_id, "text": chunk}
+    if disable_link_preview:
+      params['link_preview_options'] = {'is_disabled': True}
     if reply_to_message_id and index == 0:
       params["reply_parameters"] = {
         "message_id": reply_to_message_id,
@@ -225,47 +204,6 @@ def send_text(
     result = telegram("sendMessage", params)
     sent = result if isinstance(result, dict) else sent
   return sent
-
-
-def sync_bot_commands(
-  pairing: dict | None,
-  runtime: dict,
-  bot_username: str | None,
-) -> bool:
-  """Keep Telegram's native command menu aligned with pairing state."""
-  paired_chat_id = int(pairing.get("chatId") or 0) if pairing else 0
-  previous_chat_id = int(runtime.get("botCommandChatId") or 0)
-  if (
-    int(runtime.get("botCommandContract") or 0) == BOT_COMMANDS_VERSION
-    and previous_chat_id == paired_chat_id
-    and str(runtime.get("botCommandUsername") or "") == str(bot_username or "")
-  ):
-    return False
-
-  telegram("setMyCommands", {
-    "commands": SETUP_COMMANDS,
-    "scope": {"type": "default"},
-  })
-  if previous_chat_id and previous_chat_id != paired_chat_id:
-    telegram("deleteMyCommands", {
-      "scope": {"type": "chat", "chat_id": previous_chat_id},
-    })
-  if paired_chat_id:
-    scope = {"type": "chat", "chat_id": paired_chat_id}
-    telegram("setMyCommands", {
-      "commands": PAIRED_COMMANDS,
-      "scope": scope,
-    })
-    telegram("setChatMenuButton", {
-      "chat_id": paired_chat_id,
-      "menu_button": {"type": "commands"},
-    })
-
-  runtime["botCommandContract"] = BOT_COMMANDS_VERSION
-  runtime["botCommandChatId"] = paired_chat_id or None
-  runtime["botCommandUsername"] = bot_username or None
-  runtime["botCommandsUpdatedAt"] = now()
-  return True
 
 
 def open_chat_markup(public_origin: str, chat_id: str) -> dict | None:
@@ -293,67 +231,6 @@ def conversation_title(pairing: dict, created_at: str | None = None) -> str:
       pass
   name = pairing.get("displayName") or "Private chat"
   return f"Telegram · {name} · {stamp.strftime('%b %-d, %H:%M')}"
-
-
-def ensure_conversation(pairing: dict) -> str:
-  saved = storage_get("conversation.json")
-  if isinstance(saved, dict) and saved.get("chatId"):
-    if saved.get("connectionId"):
-      raise BridgeError("This Store edition cannot continue external chats. Choose a Bridge conversation in Chats.", status=403)
-    return str(saved["chatId"])
-  body: dict[str, object] = {
-    "title": conversation_title(pairing),
-    "scope": f"telegram:{pairing['chatId']}",
-    "scope_label": pairing.get("displayName") or "Telegram",
-    "owner_visible": True,
-    "system_prompt": TELEGRAM_SYSTEM_PROMPT,
-  }
-  model_choice = storage_get(MODEL_STATE_PATH)
-  if isinstance(model_choice, dict):
-    model = str(model_choice.get("model") or "").strip()
-    provider = str(model_choice.get("provider") or "").strip()
-    if model and provider in PROVIDER_LABELS:
-      body["model"] = model
-      body["provider"] = provider
-  created = request_json(
-    "/api/app-chats",
-    method="POST",
-    body=body,
-  )
-  chat_id = str(created["id"])
-  storage_put("conversation.json", {"chatId": chat_id, "createdAt": now()})
-  return chat_id
-
-
-def normalize_questions(value: object) -> list[dict]:
-  if not isinstance(value, list):
-    return []
-  questions: list[dict] = []
-  for raw in value[:3]:
-    if not isinstance(raw, dict):
-      continue
-    prompt = str(raw.get("question") or "").strip()
-    if not prompt:
-      continue
-    options: list[dict] = []
-    for raw_option in (raw.get("options") or [])[:3]:
-      if isinstance(raw_option, dict):
-        label = str(raw_option.get("label") or "").strip()
-        description = str(raw_option.get("description") or "").strip()
-      else:
-        label = str(raw_option or "").strip()
-        description = ""
-      if label:
-        options.append({"label": label[:80], "description": description[:100]})
-    if not options:
-      continue
-    questions.append({
-      "header": str(raw.get("header") or "").strip()[:80],
-      "question": prompt[:320],
-      "multiSelect": bool(raw.get("multiSelect")),
-      "options": options,
-    })
-  return questions
 
 
 def question_text(state: dict, *, answered: dict | None = None) -> str:
@@ -430,133 +307,6 @@ def resolved_question_answers(state: dict) -> dict[str, str] | None:
   return result
 
 
-def edit_question_message(state: dict, public_origin: str, *, answered=None) -> None:
-  message_id = state.get("telegramMessageId")
-  if not message_id:
-    return
-  markup = (
-    {"inline_keyboard": []}
-    if answered else question_markup(state, public_origin)
-  )
-  telegram("editMessageText", {
-    "chat_id": state["telegramChatId"],
-    "message_id": message_id,
-    "text": question_text(state, answered=answered),
-    "reply_markup": markup or {"inline_keyboard": []},
-  })
-
-
-def publish_question(
-  telegram_chat_id: int,
-  mobius_chat_id: str,
-  result: dict,
-  public_origin: str,
-  *,
-  reply_to_message_id: int | None = None,
-) -> bool:
-  questions = normalize_questions(result.get("questions"))
-  question_id = str(result.get("questionId") or "")
-  if not questions or not question_id:
-    return False
-  state = {
-    "nonce": secrets.token_urlsafe(6),
-    "questionId": question_id,
-    "mobiusChatId": mobius_chat_id,
-    "telegramChatId": telegram_chat_id,
-    "questions": questions,
-    "selections": {},
-    "leadText": str(result.get("text") or "").strip()[:1000],
-    "baselineText": str(result.get("baselineText") or "").strip(),
-    "createdAt": now(),
-  }
-  sent = send_text(
-    telegram_chat_id,
-    question_text(state),
-    reply_markup=question_markup(state, public_origin),
-    reply_to_message_id=reply_to_message_id,
-  )
-  if not isinstance(sent, dict) or not sent.get("message_id"):
-    return False
-  state["telegramMessageId"] = sent["message_id"]
-  storage_put(QUESTION_STATE_PATH, state)
-  return True
-
-
-def retire_question_state(state: dict, public_origin: str, label: str) -> None:
-  try:
-    telegram("editMessageText", {
-      "chat_id": state["telegramChatId"],
-      "message_id": state["telegramMessageId"],
-      "text": question_text(state) + f"\n\n{label}",
-      "reply_markup": {"inline_keyboard": []},
-    })
-  except (BridgeError, KeyError):
-    pass
-  clear_question_state()
-
-
-def sync_question_state(public_origin: str) -> dict | None:
-  """Return the pending question only while Möbius still considers it active.
-
-  Question state can change while a long poll is already running (for example,
-  when the owner answers in Möbius).  Callers handling a Telegram update must
-  use this result instead of trusting the cached storage record.
-  """
-  state = storage_get(QUESTION_STATE_PATH)
-  if not isinstance(state, dict):
-    return None
-  chats = request_json("/api/app-chats")
-  if not isinstance(chats, list):
-    return state
-  current = next(
-    (
-      chat for chat in chats
-      if isinstance(chat, dict)
-      and str(chat.get("id") or "") == str(state.get("mobiusChatId") or "")
-    ),
-    None,
-  )
-  # Older running backends do not expose this field. Leave the question alone
-  # until the committed status contract is activated by the approved restart.
-  if isinstance(current, dict) and "pending_question_id" not in current:
-    return state
-  if (
-    current is None
-    or str(current.get("pending_question_id") or "")
-    != str(state.get("questionId") or "")
-  ):
-    retire_question_state(state, public_origin, "This question is no longer active.")
-    return None
-  return state
-
-
-_MEDIA_EMBED_RE = re.compile(r"!\[[^\]]*\]\(/api/[^)]+\)")
-
-
-def text_reply(reply: str) -> tuple[str, bool]:
-  """Keep generated visuals in the authenticated chat, never mint media grants."""
-  clean, images = _MEDIA_EMBED_RE.subn("", reply)
-  return re.sub(r"\n{3,}", "\n\n", clean).strip(), bool(images)
-
-
-def navigation_origin(settings: dict) -> str:
-  """App-owned navigation only. Never used for credentialed requests."""
-  value = settings.get("mobiusAddress", "")
-  if not isinstance(value, str) or any(ord(c) < 32 for c in value):
-    return ""
-  value = value.strip()
-  try:
-    parsed = urllib.parse.urlsplit(value)
-    if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None
-        or parsed.password is not None or parsed.path not in ("", "/")
-        or parsed.query or parsed.fragment or "\\" in value
-        or any(c.isspace() for c in value) or parsed.port == 0):
-      return ""
-  except ValueError:
-    return ""
-  return urllib.parse.urlunsplit(("https", parsed.netloc, "", "", ""))
-
-
 def append_stream_text(items: list[dict], content: str, item_id: str | None) -> None:
   if not content:
     return
@@ -602,326 +352,6 @@ def after_baseline(text: str, baseline: str) -> str:
   return clean
 
 
-_thinking_draft_mode = "rich"
-
-
-def send_thinking_draft(
-  telegram_chat_id: int,
-  draft_id: int,
-  elapsed_seconds: int,
-) -> None:
-  """Show Telegram's native temporary Thinking message for AI bots."""
-  global _thinking_draft_mode
-  label = f"Thinking {max(0, elapsed_seconds)}s"
-  if _thinking_draft_mode == "rich":
-    try:
-      telegram("sendRichMessageDraft", {
-        "chat_id": telegram_chat_id,
-        "draft_id": draft_id,
-        "rich_message": {
-          "blocks": [{"type": "thinking", "text": label}],
-        },
-      })
-      return
-    except BridgeError as exc:
-      if exc.status in {400, 404}:
-        _thinking_draft_mode = "plain"
-
-  if _thinking_draft_mode in {"rich", "plain"}:
-    try:
-      telegram("sendMessageDraft", {
-        "chat_id": telegram_chat_id,
-        "draft_id": draft_id,
-        "text": label,
-      })
-      return
-    except BridgeError as exc:
-      if exc.status in {400, 404}:
-        _thinking_draft_mode = "typing"
-
-  try:
-    telegram("sendChatAction", {
-      "chat_id": telegram_chat_id,
-      "action": "typing",
-    })
-  except BridgeError:
-    # The response itself is more important than a cosmetic activity hint.
-    pass
-
-
-def thinking_indicator(telegram_chat_id: int, interval: float = 1):
-  draft_id = secrets.randbelow(2_147_483_647) + 1
-  timing = getattr(_update_context, "timing", None)
-  draft_available = True
-
-  def text_draft(text):
-    nonlocal draft_available
-    if not draft_available:
-      return
-    try:
-      telegram("sendMessageDraft", {
-        "chat_id": telegram_chat_id, "draft_id": draft_id, "text": text,
-      })
-      if isinstance(timing, dict) and "first_draft_ms" not in timing:
-        timing["first_draft_ms"] = round((time.monotonic() - timing["started"]) * 1000, 1)
-    except BridgeError as exc:
-      if exc.status in {400, 404}:
-        draft_available = False
-      # Drafts are optional. Durable final replies never depend on them.
-      pass
-
-  return ReplyProgress(text_draft,
-                       lambda elapsed: send_thinking_draft(telegram_chat_id, draft_id, elapsed),
-                       interval=interval)
-
-
-def _read_agent_stream(
-  chat_id: str,
-  telegram_chat_id: int,
-  *,
-  baseline_text: str = "",
-  progress=None,
-) -> dict:
-  deadline = time.monotonic() + AGENT_TIMEOUT
-  items: list[dict] = []
-  error = None
-  while time.monotonic() < deadline:
-    req = urllib.request.Request(
-      f"{API_BASE}/api/chats/{chat_id}/stream?snapshot=1", headers=AUTH,
-    )
-    try:
-      with urllib.request.urlopen(req, timeout=AGENT_TIMEOUT + 20) as response:
-        if response.status == 204:
-          time.sleep(0.25)
-          continue
-        for raw in response:
-          line = raw.decode("utf-8", "replace").strip()
-          if not line.startswith("data: "):
-            continue
-          try:
-            event = json.loads(line[6:])
-          except ValueError:
-            continue
-          kind = event.get("type")
-          if kind == "stream_snapshot" and isinstance(event.get("items"), list):
-            items = [item for item in event["items"] if isinstance(item, dict)]
-          elif kind == "text":
-            append_stream_text(items, str(event.get("content") or ""), event.get("text_item_id"))
-          elif kind == "text_final":
-            finalize_stream_text(items, str(event.get("content") or ""), event.get("text_item_id"))
-          if kind in {"stream_snapshot", "text", "text_final"}:
-            current_text = after_baseline(stream_text(items), baseline_text)
-            if current_text:
-              mark_timing("first_text_ms", once=True)
-              if progress is not None:
-                # Do not expose raw private media URLs in transient drafts.
-                progress.show(text_reply(current_text)[0])
-          if kind == "error":
-            error = str(event.get("message") or "Möbius could not complete that request.")
-          elif kind == "question":
-            complete_text = stream_text(items)
-            return {
-              "kind": "question",
-              "text": after_baseline(complete_text, baseline_text),
-              "baselineText": complete_text,
-              "questionId": event.get("question_id"),
-              "questions": event.get("questions"),
-            }
-          elif kind == "done":
-            mark_timing("stream_done_ms")
-            answer = after_baseline(stream_text(items), baseline_text)
-            return {
-              "kind": "reply",
-              "text": answer or error or "Möbius completed the turn without a text reply.",
-            }
-        return {
-          "kind": "reply",
-          "text": error or "The Möbius response stream ended early. Please try again.",
-        }
-    except urllib.error.HTTPError as exc:
-      raise BridgeError(f"Could not read the Möbius reply ({exc.code})")
-    except OSError as exc:
-      raise BridgeError("The Möbius reply stream was interrupted") from exc
-  return {
-    "kind": "reply",
-    "text": "Möbius is still working on that request. Open the app to continue there.",
-  }
-
-
-def read_agent_stream(
-  chat_id: str,
-  telegram_chat_id: int,
-  *,
-  baseline_text: str = "",
-) -> dict:
-  with thinking_indicator(telegram_chat_id) as progress:
-    return _read_agent_stream(
-      chat_id,
-      telegram_chat_id,
-      baseline_text=baseline_text,
-      progress=progress,
-    )
-
-
-def deliver_agent_result(
-  pairing: dict,
-  mobius_chat_id: str,
-  result: dict,
-  public_origin: str,
-  *,
-  reply_to_message_id: int | None = None,
-) -> None:
-  telegram_chat_id = int(pairing["chatId"])
-  if result.get("kind") == "question":
-    if publish_question(
-      telegram_chat_id,
-      mobius_chat_id,
-      result,
-      public_origin,
-      reply_to_message_id=reply_to_message_id,
-    ):
-      activity("Asked a question in Telegram", "good")
-      return
-    send_text(
-      telegram_chat_id,
-      "Möbius needs an answer. Open this conversation in Möbius to continue.",
-      reply_markup=open_chat_markup(public_origin, mobius_chat_id),
-      reply_to_message_id=reply_to_message_id,
-    )
-    activity("A Telegram question needed Möbius", "warn")
-    return
-  reply = str(result.get("text") or "")
-  clean_reply, has_images = text_reply(reply)
-  if has_images:
-    hint = "Open this conversation in Möbius to view the images."
-    if not public_origin:
-      hint += " Add your Möbius address in Bridge settings to enable the link."
-    clean_reply = (clean_reply + "\n\n" + hint).strip()
-  send_text(
-    telegram_chat_id,
-    clean_reply or "Done.",
-    reply_markup=open_chat_markup(public_origin, mobius_chat_id) if has_images else None,
-    reply_to_message_id=reply_to_message_id,
-  )
-  mark_timing("delivered_ms")
-  activity("Replied to a Telegram message", "good")
-
-
-def recover_completed_reply(chat_id, cid):
-  """Recover a completed accepted message without re-running the agent."""
-  chat = request_json(f"/api/chats/{chat_id}?limit=100")
-  found = False
-  texts = []
-  for row in chat.get("messages", []):
-    if row.get("role") == "user":
-      if found:
-        break
-      found = row.get("cid") == cid
-    elif found and row.get("role") == "assistant" and row.get("content"):
-      texts.append(str(row["content"]))
-  return {"kind": "reply", "text": "\n\n".join(texts) or
-          "Your earlier request was already accepted. Open this conversation in Möbius to see its result."}
-
-
-def ask_mobius(
-  pairing: dict,
-  text: str,
-  public_origin: str,
-  *,
-  reply_to_message_id: int | None = None,
-) -> None:
-  telegram_chat_id = int(pairing["chatId"])
-  cid = message_cid("telegram")
-  journal = storage_get("telegram-delivery.json")
-  chat_id = (str(journal["chatId"]) if isinstance(journal, dict)
-             and journal.get("cid") == cid and journal.get("chatId")
-             else ensure_conversation(pairing))
-  if isinstance(journal, dict) and journal.get('cid') == cid and journal.get('connectionId'):
-    raise BridgeError("Continue this earlier request in Möbius.", status=403)
-  storage_put("telegram-delivery.json", {"cid": cid, "chatId": chat_id})
-  mark_timing("conversation_ready_ms")
-  submitted = request_json(
-    f"/api/chats/{chat_id}/messages",
-    method="POST",
-    body={"content": text[:12000]+"\n\n"+bridge_assistants.CONTEXT, "cid": cid},
-  )
-  mark_timing("submitted_ms")
-  if isinstance(submitted, dict) and submitted.get("status") == "duplicate" and not submitted.get("running"):
-    result = recover_completed_reply(chat_id, cid)
-  else:
-    result = read_agent_stream(chat_id, telegram_chat_id)
-  deliver_agent_result(
-    pairing,
-    chat_id,
-    result,
-    public_origin,
-    reply_to_message_id=reply_to_message_id,
-  )
-
-
-def command_markup(public_origin: str, current_chat_id: str | None) -> dict:
-  # Global navigation lives in Telegram's native menu, not repeated footers.
-  rows=[]
-  if public_origin:rows.append([{"text":"Open Möbius","url":f"{public_origin}/shell/"+(f"?chat={current_chat_id}" if current_chat_id else "")}])
-  return {"inline_keyboard":rows}
-
-
-OWNER_SETTINGS = 'Owner settings\nThese control your Möbius conversation. Manage specialist bots separately in My bots.'
-
-def owner_home(pairing, public_origin, current_chat_id):
-  text='Your Möbius\nType what you want to do. Use Telegram’s menu for Chats, My bots or Settings.'
-  markup=command_markup(public_origin,current_chat_id)
-  try:chats=request_json('/api/app-chats')
-  except BridgeError:
-    return text+'\n\nCurrent chat status is unavailable. Open Chats to check.',markup
-  current=next((c for c in chats if isinstance(c,dict) and str(c.get('id'))==str(current_chat_id) and c.get('scope')==f"telegram:{pairing['chatId']}"),None) if isinstance(chats,list) else None
-  if current:
-    text+='\n\nCurrent chat: '+str(current.get('title') or 'Conversation')
-    if current.get('pending_question_id'):
-      text+='\nWaiting for your answer. Use the question buttons above or open it in Möbius.'
-      if public_origin:markup['inline_keyboard']=[[{'text':'Answer in Möbius','url':f'{public_origin}/shell/?chat={current_chat_id}'}]]
-  else:
-    text+='\n\nChoose a conversation in Chats.'
-  return text,markup
-
-def navigation_reply(chat_id,text,markup,message=None):
-  """A tap edits that message; only a definite missing edit gets a fresh reply."""
-  if message and message.get('message_id'):
-    try:
-      telegram('editMessageText',{'chat_id':chat_id,'message_id':message['message_id'],'text':text,'reply_markup':markup})
-      return
-    except BridgeError as exc:
-      if exc.reason == 'not-modified':return
-      if exc.status != 400 or exc.reason != 'edit-unavailable':raise
-  send_text(chat_id,text,reply_markup=markup)
-
-
-def show_chats(pairing, public_origin, message=None, page=0):
-  chats=request_json('/api/app-chats')
-  chats=[c for c in chats if isinstance(c,dict) and c.get('scope')==f"telegram:{pairing['chatId']}"] if isinstance(chats,list) else []
-  page=max(0,min(page,max(0,(len(chats)-1)//6)))
-  current=(storage_get('conversation.json') or {}).get('chatId')
-  rows=[[{'text':('✓ ' if c['id']==current else '')+str(c.get('title') or 'Conversation')[:50],'callback_data':'chat:'+str(c['id'])}] for c in chats[page*6:(page+1)*6]]
-  nav=[]
-  if page:nav.append({'text':'← Previous','callback_data':f'chats:{page-1}'})
-  if (page+1)*6<len(chats):nav.append({'text':'Next →','callback_data':f'chats:{page+1}'})
-  if nav:rows.append(nav)
-  rows.append([{'text':'New chat','callback_data':'cmd:new'}])
-  body={'chat_id':int(pairing['chatId']),'text':'Chats\n✓ marks your current conversation. Choose where your next message goes.','reply_markup':{'inline_keyboard':rows}}
-  navigation_reply(body['chat_id'],body['text'],body['reply_markup'],message)
-
-
-def settings_markup(public_origin, current_chat_id):
-  rows=[[{"text":"Choose model","callback_data":"cmd:model"}]]
-  if public_origin and current_chat_id:rows.append([{"text":"Open Möbius","url":f"{public_origin}/shell/?chat={current_chat_id}"}])
-  return {"inline_keyboard":rows}
-
-
-_model_cache = None
-_model_cache_at = 0.0
-_model_cache_lock = threading.Lock()
-
-
 def available_models(*, refresh=False) -> dict[str, list[dict[str, str]]]:
   """Return visible, available models grouped for Telegram's compact picker."""
   global _model_cache, _model_cache_at
@@ -934,11 +364,11 @@ def available_models(*, refresh=False) -> dict[str, list[dict[str, str]]]:
     raise BridgeError("Möbius could not load the model list")
   hidden: set[str] = set()
   try:
-    prefs = request_json("/api/owner/model-prefs")
-    if isinstance(prefs, dict) and isinstance(prefs.get("hidden_ids"), list):
-      hidden = {str(item) for item in prefs["hidden_ids"]}
+    preferences = request_json("/api/owner/model-prefs")
+    if isinstance(preferences, dict) and isinstance(preferences.get("hidden_ids"), list):
+      hidden = {str(item) for item in preferences["hidden_ids"]}
   except BridgeError:
-    # Visibility preferences are optional; model availability is authoritative.
+    # Availability is authoritative when optional owner preferences are restricted.
     pass
   result: dict[str, list[dict[str, str]]] = {}
   for provider in PROVIDER_LABELS:
@@ -947,10 +377,10 @@ def available_models(*, refresh=False) -> dict[str, list[dict[str, str]]]:
       continue
     models = []
     for row in rows:
-      if not isinstance(row, dict) or row.get("available") is False:
+      if not isinstance(row, dict) or row.get("available") is not True:
         continue
       model = str(row.get("id") or "").strip()
-      if not model or model in hidden:
+      if not model or model in hidden or len(f"mdl:s:{provider}:{model}".encode())>64:
         continue
       models.append({
         "id": model,
@@ -1058,106 +488,10 @@ def send_model_picker(chat_id: int) -> None:
   )
 
 
-def submit_question_state(
-  state: dict,
-  pairing: dict,
-  public_origin: str,
-) -> bool:
-  answers = resolved_question_answers(state)
-  if not answers:
-    return False
-  chat_id = str(state.get("mobiusChatId") or "")
-  lines = [f"- {question}: {answer}" for question, answer in answers.items()]
-  try:
-    request_json(
-      f"/api/chats/{chat_id}/messages",
-      method="POST",
-      body={
-        "content": "\n".join(lines),
-        "hidden": True,
-        "answers": answers,
-        "question_id": state.get("questionId"),
-        "cid": message_cid("telegram-answer"),
-      },
-    )
-  except BridgeError as exc:
-    if exc.status in {404, 409, 410}:
-      retire_question_state(
-        state, public_origin, "This question is no longer active.",
-      )
-      send_text(
-        int(pairing["chatId"]),
-        "That question was already answered or stopped in Möbius.",
-        reply_markup=open_chat_markup(public_origin, chat_id),
-      )
-      return True
-    raise
-  clear_question_state()
-  indexed_answers = {
-    str(index): answers.get(str(question.get("question") or ""), "")
-    for index, question in enumerate(state.get("questions") or [])
-  }
-  try:
-    edit_question_message(state, public_origin, answered=indexed_answers)
-  except BridgeError:
-    pass
-  result = read_agent_stream(
-    chat_id,
-    int(pairing["chatId"]),
-    baseline_text=str(state.get("baselineText") or ""),
-  )
-  deliver_agent_result(pairing, chat_id, result, public_origin)
-  return True
-
-
 def stale_callback(callback_id: str) -> None:
   answer_callback(
     callback_id, text="This question is no longer active.",
   )
-
-
-_update_context = threading.local()
-
-
-def acknowledge_received_callback(update: dict, pairing: dict | None) -> bool:
-  callback = update.get("callback_query")
-  if not isinstance(callback, dict) or not pairing:
-    return False
-  if (int((callback.get("from") or {}).get("id") or 0) != int(pairing.get("userId") or 0)
-      or int(((callback.get("message") or {}).get("chat") or {}).get("id") or 0) != int(pairing.get("chatId") or 0)):
-    return False
-  try:
-    telegram("answerCallbackQuery", {"callback_query_id": callback["id"]})
-    return True
-  except BridgeError:
-    return False
-
-
-def dispatch_update(update, settings, pairing, public_origin):
-  _update_context.update = update
-  _update_context.timing = {"started": time.monotonic()}
-  try:
-    return handle_update(update, settings, pairing, public_origin)
-  except BridgeError as exc:
-    if pairing:
-      try:
-        send_text(int(pairing["chatId"]), f"Bridge error: {str(exc)[:300]}")
-      except BridgeError:
-        pass
-    activity("A Telegram message failed", "warn")
-    return pairing
-  finally:
-    timing = dict(getattr(_update_context, "timing", {}))
-    started = timing.pop("started", None)
-    if started is not None and "submitted_ms" in timing:
-      timing["finished_ms"] = round((time.monotonic() - started) * 1000, 1)
-      timing["at"] = now()
-      try:
-        storage_put("latency.json", timing)
-      except BridgeError:
-        pass
-    _update_context.update = None
-    _update_context.timing = None
 
 
 def mark_timing(name, *, once=False):
@@ -1213,6 +547,7 @@ def handle_callback_query(
   if (
     not pairing
     or int(user.get("id") or 0) != int(pairing.get("userId") or 0)
+    or chat.get("type") != "private"
     or int(chat.get("id") or 0) != int(pairing.get("chatId") or 0)
   ):
     answer_callback(
@@ -1220,36 +555,20 @@ def handle_callback_query(
     )
     return pairing
 
-  if data.startswith('chats:'):
+  if data.startswith(('chats:', 'chat:', 'go:')):
     answer_callback(callback_id)
-    page=data.split(':',1)[1]
-    show_chats(pairing,public_origin,message,int(page) if page.isdigit() else 0)
-    return pairing
-  if data.startswith('chat:'):
-    if sync_question_state(public_origin):
-      answer_callback(callback_id,text='Answer the current question before switching chats.');return pairing
-    identity=data.split(':',1)[1]
-    chats=request_json('/api/app-chats')
-    selected=next((c for c in chats if isinstance(c,dict) and str(c.get('id'))==identity and c.get('scope')==f"telegram:{pairing['chatId']}"),None) if isinstance(chats,list) else None
-    if not selected:
-      answer_callback(callback_id,text='This chat is unavailable. Open Chats again.');return pairing
-    storage_put('conversation.json',{'chatId':identity,'createdAt':selected.get('created_at') or now()})
-    answer_callback(callback_id)
-    navigation_reply(int(pairing['chatId']),'Current chat: '+str(selected.get('title') or 'Conversation')+'\nYour next message goes here.',command_markup(public_origin,identity),message)
+    chat_callback(data,pairing,public_origin,message)
     return pairing
 
-  if data in ('cmd:settings','cmd:home'):
+  # Older Telegram messages retain their Settings callback after a menu update.
+  if data == 'cmd:settings':
+    data = 'cmd:model'
+
+  if data == 'cmd:home':
     answer_callback(callback_id)
     conversation=storage_get('conversation.json') or {}
-    markup=settings_markup(public_origin,conversation.get('chatId')) if data=='cmd:settings' else command_markup(public_origin,conversation.get('chatId'))
-    if data=='cmd:settings':text=OWNER_SETTINGS
-    else:text,markup=owner_home(pairing,public_origin,conversation.get('chatId'))
+    text,markup=owner_home(pairing,public_origin,conversation.get('chatId'))
     navigation_reply(int(pairing['chatId']),text,markup,message)
-    return pairing
-
-  if data.startswith("ua:"):
-    answer_callback(callback_id)
-    bridge_access.callback(SimpleNamespace(**globals()), data, pairing, public_origin, message)
     return pairing
 
   if data == "cmd:assistants" or data.startswith("studio:"):
@@ -1267,7 +586,7 @@ def handle_callback_query(
     new_chat_id = ensure_conversation(pairing)
     send_text(
       int(pairing["chatId"]),
-      "Fresh Möbius conversation ready.",
+      "Personal · New conversation ready.\nYour next message goes here.",
     )
     activity("Started a fresh Telegram conversation")
     return pairing
@@ -1336,7 +655,7 @@ def handle_callback_query(
         }])
       edit_model_picker(
         message,
-        f"Now using {option['label']}. A fresh Möbius conversation is ready.",
+        f"Personal · New conversation ready.\nNow using {option['label']}.",
         {"inline_keyboard": rows},
       )
       activity(f"Changed Telegram model to {option['label']}", "good")
@@ -1345,9 +664,10 @@ def handle_callback_query(
     return pairing
 
   state = sync_question_state(public_origin)
-  if not isinstance(state, dict):
+  if not isinstance(state, dict) or state.get("external") or not state.get("telegramMessageId"):
     stale_callback(callback_id)
     return pairing
+  question_guard(state, pairing)
   parts = data.split(":")
   if len(parts) < 2 or parts[1] != str(state.get("nonce") or ""):
     stale_callback(callback_id)
@@ -1358,6 +678,7 @@ def handle_callback_query(
   if parts[0] == "q" and len(parts) == 4:
     try:
       question_index, option_index = int(parts[2]), int(parts[3])
+      if question_index < 0 or option_index < 0: raise ValueError()
       question = questions[question_index]
       label = str(question["options"][option_index]["label"])
     except (IndexError, KeyError, TypeError, ValueError):
@@ -1376,6 +697,23 @@ def handle_callback_query(
     else:
       selections[key] = label
     state["selections"] = selections
+    chosen=state.get('selectedOptions') or {}
+    typed_questions=set(state.get('typedQuestions') or [])
+    option_id=question['options'][option_index].get('id')
+    if not question.get('multiSelect'):
+      typed_questions.discard(question['id'])
+      if isinstance(option_id,str) and option_id:chosen[question['id']]=[option_id]
+      else:chosen.pop(question['id'],None)
+    elif question['id'] in typed_questions:
+      # A mixed free-text/button answer never promotes typed labels to consent.
+      chosen.pop(question['id'],None)
+    elif isinstance(option_id,str) and option_id:
+      ids=list(chosen.get(question['id']) or [])
+      if option_id in ids:ids.remove(option_id)
+      else:ids.append(option_id)
+      chosen[question['id']]=ids
+    state['typedQuestions']=list(typed_questions)
+    state['selectedOptions']=chosen
     state.pop("awaitingTextQuestion", None)
     state.pop("promptMessageId", None)
     storage_put(QUESTION_STATE_PATH, state)
@@ -1388,6 +726,7 @@ def handle_callback_query(
   if parts[0] == "t" and len(parts) == 3:
     try:
       question_index = int(parts[2])
+      if question_index < 0: raise ValueError()
       prompt = str(questions[question_index]["question"])
     except (IndexError, KeyError, TypeError, ValueError):
       stale_callback(callback_id)
@@ -1425,12 +764,19 @@ def handle_pending_text_answer(
   pairing: dict,
   public_origin: str,
 ) -> bool:
+  text = str(message.get("text") or "").strip()
+  if contains_bot_key(text):
+    send_text(int(pairing['chatId']), 'Do not send bot keys in Telegram. Use the saved secure-input form in your Möbius owner chat.')
+    return True
   state = sync_question_state(public_origin)
   if not isinstance(state, dict):
     return False
-  text = str(message.get("text") or "").strip()
+  if state.get("external") or not state.get("telegramMessageId"):
+    send_text(int(pairing["chatId"]), "Answer the saved card in Möbius before continuing.", reply_markup=open_chat_markup(public_origin,state["mobiusChatId"]))
+    return True
+  question_guard(state, pairing)
   awaiting = state.get("awaitingTextQuestion")
-  if not isinstance(awaiting, int):
+  if type(awaiting) is not int or awaiting < 0:
     send_text(
       int(pairing["chatId"]),
       "Möbius is waiting for your answer. Use the buttons above, or tap “Type another answer”.",
@@ -1454,6 +800,10 @@ def handle_pending_text_answer(
   else:
     selections[str(awaiting)] = text[:500]
   state["selections"] = selections
+  chosen=state.get('selectedOptions') or {}
+  chosen.pop(question['id'],None)
+  state['typedQuestions']=list(set(state.get('typedQuestions') or [])|{question['id']})
+  state['selectedOptions']=chosen
   state.pop("awaitingTextQuestion", None)
   state.pop("promptMessageId", None)
   storage_put(QUESTION_STATE_PATH, state)
@@ -1493,6 +843,7 @@ def handle_update(
     parts = text.split(maxsplit=1)
     supplied = parts[1].strip().upper() if len(parts) == 2 and parts[0].split("@", 1)[0] in {"/pair", "/start"} else ""
     expected = str(settings.get("pairingCode") or "").upper()
+    if chat_id != user_id or user_id <= 0: return pairing
     if supplied and expected and hmac.compare_digest(supplied, expected):
       pairing = {
         "chatId": chat_id,
@@ -1501,8 +852,10 @@ def handle_update(
         "username": user.get("username"),
         "pairedAt": now(),
       }
+      # Consume the one-time code durably before external acknowledgement.
       storage_put("pairing.json", pairing)
-      send_text(chat_id, "Paired securely. Send me a message and I’ll pass it to Möbius. Use /new for a fresh conversation or /help for commands.")
+      storage_put("settings.json", {**settings, "pairingCode": None})
+      send_text(chat_id, "Paired securely. Send me a message and I’ll pass it to Möbius. Use /new for a fresh conversation or /menu for commands.")
       activity("Telegram chat paired", "good")
     elif text.startswith(("/start", "/pair")):
       send_text(chat_id, "Open Telegram Bridge in Möbius and use the current pairing code shown there.")
@@ -1510,16 +863,21 @@ def handle_update(
 
   if chat_id != int(pairing.get("chatId") or 0) or user_id != int(pairing.get("userId") or 0):
     return pairing
+  if update.get('_bridge_rejected_input') is True:
+    send_text(chat_id, 'Do not send bot keys in Telegram. Use the saved secure-input form in your Möbius owner chat.', reply_to_message_id=message_id)
+    return pairing
   if not text:
     send_text(
       chat_id,
-      "I can currently read text messages only. Send a text prompt or use /help for commands.",
+      "I can currently read text messages only. Send a text prompt or use /menu for commands.",
       reply_to_message_id=message_id,
     )
     return pairing
   command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
   if command=="/chats":
     show_chats(pairing,public_origin)
+  elif command=="/bridge":
+    show_bridge(pairing,public_origin)
   elif command in ("/bots","/assistants"):
     bridge_assistants.show(SimpleNamespace(**globals()), pairing, public_origin)
   elif command == "/new":
@@ -1537,12 +895,11 @@ def handle_update(
     new_chat_id = ensure_conversation(pairing)
     send_text(
       chat_id,
-      "Fresh Möbius conversation ready. It is now visible in your Möbius chat list.",
+      "Personal · New conversation ready.\nYour next message goes here.",
     )
     activity("Started a fresh Telegram conversation")
   elif command == "/settings":
-    conversation=storage_get('conversation.json') or {}
-    send_text(chat_id,OWNER_SETTINGS,reply_markup=settings_markup(public_origin,conversation.get('chatId')))
+    send_text(chat_id, "Use /model to choose your model.", reply_to_message_id=message_id)
   elif command == "/model":
     send_model_picker(chat_id)
   elif command == "/status":
@@ -1551,12 +908,16 @@ def handle_update(
       str(conversation.get("chatId") or "")
       if isinstance(conversation, dict) else ""
     )
+    context,_ = owner_context(pairing,current_chat_id)
     send_text(
       chat_id,
-      "Telegram Bridge is connected and this private chat is paired.",
+      "Bridge connected · private chat paired.\n\n"+context,
       reply_markup=command_markup(public_origin, current_chat_id),
     )
-  elif command in {"/help", "/start"}:
+  elif command == "/help":
+    # Old command-list entries can remain cached in Telegram clients.
+    send_text(chat_id, "Use /menu for Conversations and Model.", reply_to_message_id=message_id)
+  elif command in {"/menu", "/start"}:
     conversation = storage_get("conversation.json")
     current_chat_id = (
       str(conversation.get("chatId") or "")
@@ -1564,8 +925,6 @@ def handle_update(
     )
     text,markup=owner_home(pairing,public_origin,current_chat_id)
     send_text(chat_id,text,reply_markup=markup)
-  elif bridge_assistants.input_reply(SimpleNamespace(**globals()), message, pairing, public_origin):
-    pass
   elif handle_pending_text_answer(message, pairing, public_origin):
     pass
   elif text:
@@ -1578,69 +937,357 @@ def handle_update(
   return pairing
 
 
-def main() -> int:
-  settings = storage_get("settings.json")
-  if not isinstance(settings, dict):
-    set_status("waiting", "Open the app once", "Telegram Bridge needs its first-time pairing code.")
-    return 0
-  if settings.get("enabled") is False:
-    set_status("paused", "Bridge paused", "Resume it in the app when you want Telegram messages handled.")
-    return 0
 
-  # Optional question state is read during each paired poll. Create the empty
-  # record once rather than treating its expected absence as a recurring 404.
-  ensure_storage_null(QUESTION_STATE_PATH)
+def own_chats(pairing):
+ rows=request_json('/api/app-chats')
+ if not isinstance(rows,list):raise BridgeError('Conversation status unavailable.')
+ result=[r for r in rows if isinstance(r,dict) and r.get('created_by_app_id')==APP_ID and r.get('scope')==f"telegram:{pairing['chatId']}"]
+ if any(not isinstance(r.get('id'),str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',r['id']) or 'pending_question_id' not in r for r in result):
+  raise BridgeError('Conversation status unavailable.')
+ return result
 
+
+def ensure_conversation(pairing):
+ saved=storage_get('conversation.json')
+ if isinstance(saved,dict) and saved.get('chatId'):
+  if saved.get('connectionId') or not any(r['id']==saved['chatId'] for r in own_chats(pairing)):
+   raise BridgeError('Selected conversation is unavailable. Nothing was rerouted. Choose /chats or /new.')
+  return saved['chatId']
+ body={'title':conversation_title(pairing),'scope':f"telegram:{pairing['chatId']}",
+  'scope_label':pairing.get('displayName') or 'Telegram','owner_visible':True,'system_prompt':TELEGRAM_SYSTEM_PROMPT}
+ model=storage_get(MODEL_STATE_PATH)
+ if isinstance(model,dict):
+  options=available_models(refresh=True)
+  if not any(m['id']==model.get('model') for m in options.get(model.get('provider'),[])):
+   raise BridgeError('Selected model is unavailable. Choose /model before starting.')
+  body.update(provider=model['provider'],model=model['model'])
+ created=request_json('/api/app-chats',method='POST',body=body)
+ cid=str(created['id']);storage_put('conversation.json',{'chatId':cid,'createdAt':now()});return cid
+
+
+def owner_context(pairing,current_chat_id):
+ row=next((r for r in own_chats(pairing) if r['id']==current_chat_id),None)
+ if not row:return 'No current personal conversation. Choose /chats or /new.',None
+ text='Personal · Current conversation: '+str(row.get('title') or 'Conversation')[:180]
+ if row.get('pending_question_id'):text+='\nWaiting for your answer; trusted owner actions stay in Möbius.'
+ elif row.get('running'):text+='\nWorking.'
+ return text,row
+
+
+def command_markup(public_origin,current_chat_id):
+ rows=[]
+ if public_origin:
+  path='/shell/'+('?' + urllib.parse.urlencode({'chat':current_chat_id}) if current_chat_id else '')
+  rows.append([{'text':'Open Möbius','url':public_origin+path}])
+ return {'inline_keyboard':rows}
+
+
+def owner_home(pairing,public_origin,current_chat_id):
+ context,row=owner_context(pairing,current_chat_id)
+ rows=[[{'text':'Conversations','callback_data':'chats:0'},{'text':'Model','callback_data':'cmd:model'}],
+  [{'text':'Your bots','callback_data':'cmd:assistants'},{'text':'New conversation','callback_data':'cmd:new'}]]
+ rows+=command_markup(public_origin,current_chat_id)['inline_keyboard']
+ return 'Menu\nSend a message to continue.\n\n'+context,{'inline_keyboard':rows}
+
+
+def show_bridge(pairing,public_origin):
+ send_text(int(pairing['chatId']),'Open Bridge in Möbius for Chats, Bots and Tools. No Telegram panel is included.',
+  reply_markup={'inline_keyboard':[[{'text':'Open Bridge','url':f'{public_origin}/shell/?app={APP_ID}'}]]} if public_origin else None)
+
+
+def navigation_reply(chat_id,text,markup,message=None,*,disable_link_preview=False):
+ if message and message.get('message_id'):
   try:
-    bot = telegram("getMe")
+   telegram('editMessageText',{'chat_id':chat_id,'message_id':message['message_id'],'text':text,'reply_markup':markup});return
   except BridgeError as exc:
-    if exc.reason in ("key-unavailable", "invalid-key") or exc.status in (401, 404):
-      set_status("needs_token", "Check your bot connection", "Open the app and connect or replace the bot key using the secure card in Möbius chat.")
-    else:
-      set_status("error", "Bot connection failed", str(exc)[:180])
-    return 0
+   if exc.reason=='not-modified':return
+   if exc.reason!='edit-unavailable':raise
+ send_text(chat_id,text,reply_markup=markup,disable_link_preview=disable_link_preview)
 
-  username = bot.get("username") if isinstance(bot, dict) else None
-  context = request_json(f"/api/apps/{APP_ID}/job-context")
-  public_origin = navigation_origin(settings)
+
+def show_chats(pairing,public_origin,message=None,page=0):
+ rows=own_chats(pairing);page=max(0,min(page,max(0,(len(rows)-1)//6)))
+ current=(storage_get('conversation.json') or {}).get('chatId')
+ buttons=[[{'text':('✓ ' if r['id']==current else '')+str(r.get('title') or 'Conversation')[:50],'callback_data':'chat:'+r['id']}] for r in rows[page*6:(page+1)*6]]
+ nav=[]
+ if page:nav.append({'text':'‹ Previous','callback_data':f'chats:{page-1}'})
+ if (page+1)*6<len(rows):nav.append({'text':'Next ›','callback_data':f'chats:{page+1}'})
+ if nav:buttons.append(nav)
+ buttons.append([{'text':'New conversation','callback_data':'cmd:new'}])
+ navigation_reply(int(pairing['chatId']),'Personal conversations\nBrowsing never switches your destination.\n'+('Choose a conversation to review its status.' if rows else 'No personal conversations yet.'),{'inline_keyboard':buttons},message)
+
+
+def chat_callback(data,pairing,origin,message):
+ if data.startswith('chats:') and data[6:].isdigit() and len(data)<16:
+  show_chats(pairing,origin,message,int(data[6:]));return
+ prefix,_,cid=data.partition(':')
+ if prefix not in ('chat','go') or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',cid):raise BridgeError('Unavailable conversation control.')
+ row=next((r for r in own_chats(pairing) if r['id']==cid),None)
+ if not row:raise BridgeError('This conversation is unavailable. Nothing was switched.')
+ if prefix=='go':
+  if sync_question_state(origin):raise BridgeError('Answer the current question before switching conversations.')
+  storage_put('conversation.json',{'chatId':cid,'createdAt':row.get('created_at') or now()})
+  navigation_reply(int(pairing['chatId']),'Personal · Your next message goes to '+str(row.get('title') or 'Conversation'),command_markup(origin,cid),message);return
+ buttons=[[{'text':'Continue here','callback_data':'go:'+cid}]]
+ if origin:buttons.append([{'text':'Open in Möbius','url':f'{origin}/shell/?chat={urllib.parse.quote(cid,safe="")}'}])
+ buttons.append([{'text':'‹ Conversations','callback_data':'chats:0'}])
+ text=str(row.get('title') or 'Conversation')+'\n'+('Waiting for your answer' if row.get('pending_question_id') else 'Working' if row.get('running') else 'Ready to continue')
+ navigation_reply(int(pairing['chatId']),text+'\nNo transcript preview is exposed. Review or Continue here.',{'inline_keyboard':buttons},message)
+
+
+def normalize_questions(value):
+ if not isinstance(value,list) or not 1<=len(value)<=6:return []
+ output=[]
+ for q in value:
+  if not isinstance(q,dict) or not isinstance(q.get('id'),str) or not q['id'] or not isinstance(q.get('question'),str):return []
+  opts=q.get('options')
+  if not isinstance(opts,list) or not 1<=len(opts)<=10:return []
+  if any(not isinstance(o,dict) or not isinstance(o.get('label'),str) or not o['label'] for o in opts):return []
+  # Preserve canonical ids, prompts and labels exactly. UI labels alone truncate.
+  output.append({**q,'options':[dict(o) for o in opts]})
+ if len({q['id'] for q in output})!=len(output):return []
+ return output
+
+
+def question_guard(state,pairing):
+ if int(state.get('telegramChatId') or 0)!=int(pairing['chatId']) or state.get('pairingBinding')!=hashlib.sha256(json.dumps(pairing,sort_keys=True).encode()).hexdigest():
+  raise BridgeError('Question pairing changed. Answer in Möbius.')
+ if not any(r['id']==state.get('mobiusChatId') for r in own_chats(pairing)):raise BridgeError('Question conversation is unavailable.')
+
+
+def edit_question_message(state,public_origin,*,answered=None):
+ if state.get('telegramMessageId'):
+  telegram('editMessageText',{'chat_id':state['telegramChatId'],'message_id':state['telegramMessageId'],
+   'text':question_text(state,answered=answered),'reply_markup':{'inline_keyboard':[]} if answered else question_markup(state,public_origin)})
+
+
+def retire_question_state(state,public_origin,label):
+ try:
+  telegram('editMessageText',{'chat_id':state['telegramChatId'],'message_id':state['telegramMessageId'],
+   'text':question_text(state)+'\n\n'+label,'reply_markup':{'inline_keyboard':[]}})
+ except (BridgeError,KeyError):pass
+ clear_question_state()
+
+
+def sync_question_state(public_origin):
+ pairing=storage_get('pairing.json')
+ state=storage_get(QUESTION_STATE_PATH)
+ if not isinstance(pairing,dict):raise BridgeError('Private owner pairing unavailable.')
+ rows=own_chats(pairing)
+ current_id=(storage_get('conversation.json') or {}).get('chatId')
+ # A canonical pending card can exist without a Telegram card after restart or
+ # failed delivery. It still blocks /new, model and routing; never guess empty.
+ if not isinstance(state,dict):
+  row=next((r for r in rows if r['id']==current_id),None)
+  if row and row.get('pending_question_id'):
+   return {'mobiusChatId':current_id,'questionId':row['pending_question_id'],'external':True}
+  return None
+ question_guard(state,pairing)
+ row=next((r for r in rows if r['id']==state['mobiusChatId']),None)
+ if not row or row.get('pending_question_id')!=state.get('questionId'):
+  retire_question_state(state,public_origin,'This question is no longer active.')
+  selected=next((r for r in rows if r['id']==current_id),None)
+  if selected and selected.get('pending_question_id'):return {'mobiusChatId':current_id,'questionId':selected['pending_question_id'],'external':True}
+  return None
+ return state
+
+
+def publish_question(telegram_chat_id,mobius_chat_id,result,public_origin,*,reply_to_message_id=None):
+ qs=normalize_questions(result.get('questions'));pair=storage_get('pairing.json')
+ if not qs or not isinstance(pair,dict) or result.get('secure') or result.get('ownerOnly'):return False
+ # Canonical card fields are never rewritten into a different saved question.
+ # A private-media card must be answered in its authenticated Möbius view.
+ canonical=json.dumps(qs,ensure_ascii=False)
+ if clean_text(canonical)!=canonical:return False
+ state={'nonce':secrets.token_urlsafe(6),'questionId':result.get('questionId'),'mobiusChatId':mobius_chat_id,
+  'telegramChatId':telegram_chat_id,'questions':qs,'selections':{},'createdAt':now(),'leadText':clean_text(result.get('text') or '')[:1000],
+  'baselineText':clean_text(result.get('baselineText') or ''), 'pairingBinding':hashlib.sha256(json.dumps(pair,sort_keys=True).encode()).hexdigest()}
+ question_guard(state,pair)
+ row=next(r for r in own_chats(pair) if r['id']==mobius_chat_id)
+ if row.get('pending_question_id')!=state['questionId'] or len(question_text(state))>3700:return False
+ # Reserve the card before delivery so a crash never silently republishes it.
+ storage_put(QUESTION_STATE_PATH,state)
+ sent=send_text(telegram_chat_id,question_text(state),reply_markup=question_markup(state,public_origin),reply_to_message_id=reply_to_message_id)
+ if not isinstance(sent,dict) or not sent.get('message_id'):return False
+ state['telegramMessageId']=sent['message_id'];storage_put(QUESTION_STATE_PATH,state);return True
+
+
+def submit_question_state(state,pairing,public_origin):
+ question_guard(state,pairing)
+ if sync_question_state(public_origin)!=state:raise BridgeError('Question changed. Answer in Möbius.')
+ selections=state.get('selections') or {};answers={};typed={}
+ for i,q in enumerate(state['questions']):
+  v=selections.get(str(i))
+  if not v:return False
+  labels=v if isinstance(v,list) else [v]
+  answers[q['id']]=', '.join(labels)
+  ids=(state.get('selectedOptions') or {}).get(q['id'])
+  if ids:typed[q['id']]=list(ids)
+ cid=message_cid('telegram-answer')
+ attempts=storage_get('telegram-answer-attempts.json') or {};journal=attempts.get(cid)
+ if journal and journal.get('cid')==cid:
+  send_text(int(pairing['chatId']),'Your answer delivery needs review in Möbius; it was not submitted again.',reply_markup=open_chat_markup(public_origin,state['mobiusChatId']));return True
+ if len(attempts)>=2000:raise BridgeError('Answer receipt limit reached. Review in Möbius before continuing.')
+ attempts[cid]={'cid':cid,'questionId':state['questionId'],'chatId':state['mobiusChatId'],'state':'uncertain'}
+ storage_put('telegram-answer-attempts.json',attempts)
+ try:
+  submitted=request_json(f"/api/chats/{state['mobiusChatId']}/messages",method='POST',body={'content':'Answering the saved card.','hidden':True,'question_id':state['questionId'],'answers':answers,'selected_options':typed or None,'cid':cid})
+ except BridgeError as exc:
+  # 409 can mean secure input, invalid answer, or a still-open claim conflict.
+  # Preserve the card and show a safe redirect, never stale-retire or retry.
+  send_text(int(pairing['chatId']),'The answer was not confirmed. Review this card in Möbius before retrying.',reply_markup=open_chat_markup(public_origin,state['mobiusChatId']));return True
+ clear_question_state()
+ attempts[cid]={'cid':cid,'questionId':state['questionId'],'chatId':state['mobiusChatId'],'state':'accepted'}
+ storage_put('telegram-answer-attempts.json',attempts)
+ try:edit_question_message(state,public_origin,answered={str(i):answers[q['id']] for i,q in enumerate(state['questions'])})
+ except BridgeError:pass
+ # queued is not a completed answer and must not consume another turn's stream.
+ if submitted.get('status') in ('queued','duplicate') or submitted.get('answer_turn') in ('none','retry','queued'):
+  send_text(int(pairing['chatId']),'Answer accepted. Check progress and the result in Möbius.',reply_markup=open_chat_markup(public_origin,state['mobiusChatId']));return True
+ result=read_agent_stream(state['mobiusChatId'],int(pairing['chatId']),baseline_text=str(state.get('baselineText') or ''))
+ deliver_agent_result(pairing,state['mobiusChatId'],result,public_origin);return True
+
+
+_MEDIA=re.compile(r'(?:!\[[^\]]*\]\()?/api/chats/[A-Za-z0-9_-]+/media/[^\s)]+\)?')
+def clean_text(text):
+ return _MEDIA.sub('[Private media is available in Möbius.]',str(text))
+
+
+def thinking_indicator(telegram_chat_id,interval=1):
+ draft_id=secrets.randbelow(2_147_483_647)+1
+ def send_draft(text):
+  try:telegram('sendMessageDraft',{'chat_id':telegram_chat_id,'draft_id':draft_id,'text':clean_text(text)[-3900:]})
+  except BridgeError:pass
+ def send_thinking(elapsed):
+  try:telegram('sendChatAction',{'chat_id':telegram_chat_id,'action':'typing'})
+  except BridgeError:pass
+ return ReplyProgress(send_draft,send_thinking,interval=interval)
+
+
+def read_agent_stream(chat_id,telegram_chat_id,*,baseline_text=''):
+ # Public replay-safe event-log mode, not unsupported query snapshot/reader.
+ req=urllib.request.Request(API_BASE+f'/api/chats/{chat_id}/stream',headers=AUTH)
+ items=[];deadline=time.monotonic()+AGENT_TIMEOUT
+ with thinking_indicator(telegram_chat_id) as progress:
   try:
-    webhook = telegram("getWebhookInfo")
-  except BridgeError as exc:
-    set_status("error", "Could not inspect the bot", str(exc)[:180], botUsername=username)
-    return 0
-  if isinstance(webhook, dict) and webhook.get("url"):
-    set_status(
-      "webhook_conflict",
-      "Bot already connected elsewhere",
-      "Remove its existing webhook in the previous service before using it here. Nothing was changed automatically.",
-      botUsername=username,
-    )
-    return 0
-
-  set_status("connected", "Connected", "Listening for messages from the paired private chat.", botUsername=username)
-  pairing = storage_get("pairing.json")
-  pairing = pairing if isinstance(pairing, dict) else None
-  runtime = storage_get("bridge-runtime.json")
-  runtime = runtime if isinstance(runtime, dict) else {}
-  try:
-    if sync_bot_commands(pairing, runtime, username):
-      storage_put("bridge-runtime.json", runtime)
-  except BridgeError:
-    # Command-menu setup is progressive enhancement; message delivery wins.
-    pass
-  if pairing:
-    sync_question_state(public_origin)
-  return run_listener(SimpleNamespace(**globals()), runtime, context, username)
+   opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect())
+   with opener.open(req,timeout=AGENT_TIMEOUT+20) as response:
+    if response.status==204:return {'kind':'pending','text':'Work is accepted. Check the result in Möbius.'}
+    for raw in response:
+     if len(raw)>256*1024:raise BridgeError('Reply event exceeded its bound.')
+     if time.monotonic()>deadline:return {'kind':'pending','text':'Möbius is still working. Check progress there.'}
+     if not raw.startswith(b'data: '):continue
+     try:event=json.loads(raw[6:])
+     except ValueError:continue
+     kind=event.get('type')
+     if kind=='text':append_stream_text(items,str(event.get('content') or ''),event.get('text_item_id'))
+     elif kind=='text_final':finalize_stream_text(items,str(event.get('content') or ''),event.get('text_item_id'))
+     if kind in ('text','text_final'):progress.show(clean_text(after_baseline(stream_text(items),baseline_text)))
+     if kind=='question':
+      return {'kind':'question','questionId':event.get('question_id'),'questions':event.get('questions'),'text':after_baseline(stream_text(items),baseline_text),'baselineText':stream_text(items),'secure':event.get('secure_input') or event.get('secure'),'ownerOnly':event.get('owner_action') or event.get('approval') or event.get('platform_action') or event.get('action_key') or any(q.get('id')=='approval' for q in event.get('questions',[]) if isinstance(q,dict))}
+     if kind=='done':return {'kind':'reply','text':after_baseline(stream_text(items),baseline_text) or 'Möbius completed the turn without a text reply.'}
+    return {'kind':'pending','text':'The reply stream ended before completion. Do not resubmit automatically; open Möbius.'}
+  except (OSError,urllib.error.HTTPError):return {'kind':'pending','text':'The reply could not be confirmed. Work may continue in Möbius; no request was repeated.'}
 
 
-if __name__ == "__main__":
-  try:
-    raise SystemExit(main())
-  except Exception as exc:
-    # Keep logs free of message content and provider URLs. The UI gets only a
-    # bounded class-level failure; the supervisor records the non-zero exit.
-    try:
-      set_status("error", "Bridge stopped", type(exc).__name__)
-    except Exception:
-      pass
-    raise
+def deliver_agent_result(pairing,mobius_chat_id,result,public_origin,*,reply_to_message_id=None):
+ if result.get('kind')=='question' and publish_question(int(pairing['chatId']),mobius_chat_id,result,public_origin,reply_to_message_id=reply_to_message_id):return
+ if result.get('kind')=='question':
+  text='Möbius needs an answer. Use its saved card there; trusted owner approvals and secure input are not Telegram controls.'
+ else:text=clean_text(result.get('text') or 'Check the result in Möbius.')
+ send_text(int(pairing['chatId']),text,reply_to_message_id=reply_to_message_id,
+  reply_markup=open_chat_markup(public_origin,mobius_chat_id) if result.get('kind')!='reply' or '[Private media' in text else None)
+
+
+def ask_mobius(pairing,text,public_origin,*,reply_to_message_id=None):
+ if contains_bot_key(text):
+  send_text(int(pairing['chatId']),'Do not send bot keys in Telegram. Use the saved secure-input form in your Möbius owner chat.');return
+ cid=message_cid('telegram');attempts=storage_get('telegram-attempts.json') or {};journal=attempts.get(cid)
+ if isinstance(journal,dict) and journal.get('cid')==cid:
+  chat_id=journal['chatId']
+  if not any(r['id']==chat_id for r in own_chats(pairing)):raise BridgeError('Accepted conversation unavailable. Nothing was rerouted.')
+  # Public core has no bounded completed-result recovery reader for app auth.
+  send_text(int(pairing['chatId']),'Your earlier request may already be accepted. It was not resubmitted. Check its result in Möbius.',reply_markup=open_chat_markup(public_origin,chat_id));return
+ chat_id=ensure_conversation(pairing)
+ if len(attempts)>=2000:raise BridgeError('Request receipt limit reached. Review in Möbius before continuing.')
+ attempts[cid]={'cid':cid,'chatId':chat_id,'state':'uncertain'}
+ storage_put('telegram-attempts.json',attempts)
+ submitted=request_json(f'/api/chats/{chat_id}/messages',method='POST',body={'content':text[:12000],'cid':cid})
+ attempts[cid]={'cid':cid,'chatId':chat_id,'state':'accepted'}
+ storage_put('telegram-attempts.json',attempts)
+ mark_timing('submitted_ms')
+ if not isinstance(submitted,dict):
+  send_text(int(pairing['chatId']),'The submission result is unknown. Check this conversation in Möbius before retrying.',reply_markup=open_chat_markup(public_origin,chat_id));return
+ if submitted.get('status') in ('queued','duplicate'):
+  send_text(int(pairing['chatId']),'Request accepted. Follow progress and the result in Möbius.',reply_markup=open_chat_markup(public_origin,chat_id));return
+ result=read_agent_stream(chat_id,int(pairing['chatId']))
+ deliver_agent_result(pairing,chat_id,result,public_origin,reply_to_message_id=reply_to_message_id)
+
+
+def sync_bot_commands(pairing,runtime,bot_username,public_origin=''):
+ paired=int((pairing or {}).get('chatId') or 0)
+ if runtime.get('botCommandContract')==1 and runtime.get('botCommandChatId')==paired and runtime.get('botCommandUsername')==bot_username:return False
+ telegram('setMyCommands',{'commands':[{'command':'start','description':'Pair or show help'},{'command':'pair','description':'Pair this private chat'}],'scope':{'type':'default'}})
+ old=int(runtime.get('botCommandChatId') or 0)
+ if old and old!=paired:telegram('deleteMyCommands',{'scope':{'type':'chat','chat_id':old}})
+ if paired:
+  telegram('setMyCommands',{'commands':[{'command':c,'description':d} for c,d in [('menu','Conversations and model'),('chats','Conversations'),('bots','Optional bot shortcuts'),('model','Choose model'),('new','New conversation'),('status','Current status'),('bridge','Open Bridge in Möbius')]],'scope':{'type':'chat','chat_id':paired}})
+  telegram('setChatMenuButton',{'chat_id':paired,'menu_button':{'type':'commands'}})
+ runtime.update(botCommandContract=1,botCommandChatId=paired,botCommandUsername=bot_username);return True
+
+
+def acknowledge_received_callback(update,pairing):
+ cb=update.get('callback_query') or {};chat=(cb.get('message') or {}).get('chat') or {}
+ if not pairing or chat.get('type')!='private' or chat.get('id')!=pairing.get('chatId') or (cb.get('from') or {}).get('id')!=pairing.get('userId'):return False
+ try:telegram('answerCallbackQuery',{'callback_query_id':cb['id']});return True
+ except BridgeError:return False
+
+
+def dispatch_update(update,settings,pairing,public_origin):
+ _update_context.update=update;_update_context.timing={'started':time.monotonic()}
+ try:
+  if settings.get('enabled') is False:return pairing
+  return handle_update(update,settings,pairing,public_origin)
+ except BridgeError:
+  activity('A Telegram operation needs review in Möbius.','warn')
+  return pairing
+ finally:_update_context.update=None;_update_context.timing=None
+
+
+def main():
+ global API_BASE
+ safe_origin(API_BASE)
+ settings=storage_get('settings.json')
+ if not isinstance(settings,dict) or settings.get('enabled') is not True:
+  set_status('paused','Bridge paused','Enable after secure setup and private pairing.');return 0
+ ensure_storage_null(QUESTION_STATE_PATH)
+ try:bot=bot_identity(telegram('getMe'));hook=telegram('getWebhookInfo')
+ except (TelegramError,BridgeError):
+  set_status('needs_token','Check secure setup','The dedicated bot key or Telegram connection is unavailable.');return 0
+ identity=storage_get('bot-identity.json')
+ if not isinstance(identity,dict) or identity.get('id')!=bot['id']:
+  set_status('identity_changed','Bot identity needs review','Run secure setup for this dedicated installation before listening.');return 0
+ if not isinstance(hook,dict) or hook.get('url'):
+  set_status('webhook_conflict','Bot connected elsewhere','Remove its webhook in the previous service; Bridge does not change it.');return 0
+ context=request_json(f'/api/apps/{APP_ID}/job-context')
+ origin=str(context.get('public_origin') or '').rstrip('/')
+ if origin:
+  try:safe_origin(origin)
+  except TelegramError:origin=''
+ context['public_origin']=origin
+ pairing=storage_get('pairing.json');pairing=pairing if isinstance(pairing,dict) else None
+ runtime=storage_get('bridge-runtime.json');runtime=runtime if isinstance(runtime,dict) else {}
+ try:
+  if sync_bot_commands(pairing,runtime,bot['username'],origin):storage_put('bridge-runtime.json',runtime)
+ except BridgeError:pass
+ set_status('connected','Connected','Listening only for the paired private owner.',botUsername=bot['username'])
+ if pairing:sync_question_state(origin)
+ return run_listener(SimpleNamespace(**globals()),runtime,context,bot['username'])
+
+if __name__=='__main__':
+ try:raise SystemExit(main())
+ except Exception:
+  # No traceback: urllib exceptions can contain a token-bearing URL.
+  try:set_status('error','Bridge stopped','Review connection status in Möbius; no automatic request replay.')
+  except Exception:pass
+  raise SystemExit(1)

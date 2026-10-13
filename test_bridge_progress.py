@@ -1,7 +1,9 @@
+"""Retained coalescing and shutdown regressions; transport is synthetic."""
 import threading
 import time
 import unittest
 
+from test_bridge import forbid_network
 from bridge_progress import ReplyProgress
 
 

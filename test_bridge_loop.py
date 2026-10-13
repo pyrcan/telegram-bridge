@@ -1,9 +1,12 @@
+"""Retained durable-inbox and ordered-work regressions; no network."""
 import copy
 import queue
 import threading
 import time
 import unittest
 from types import SimpleNamespace
+from contextlib import nullcontext
+from test_bridge import forbid_network
 
 from bridge_loop import run_listener, INBOX_PATH, responsive_control
 
@@ -13,7 +16,7 @@ class ListenerTests(unittest.TestCase):
     updates = queue.Queue()
     for batch in batches:
       updates.put(batch)
-    records = {'settings.json': {'enabled': True}, 'pairing.json': {'chatId': 99, 'userId': 7}}
+    records = {'settings.json': {'enabled': True}, 'pairing.json': {'chatId': 99, 'userId': 99}}
     writes, handled, cursors, acks = [], [], [], []
 
     def put(path, value):
@@ -42,7 +45,7 @@ class ListenerTests(unittest.TestCase):
       return False
 
     b = SimpleNamespace(
-      RUN_SECONDS=duration, MAINTENANCE_SECONDS=0.04, APP_ID=18,
+      RUN_SECONDS=duration, MAINTENANCE_SECONDS=0.04, APP_ID=18, inbox_lease=nullcontext,
       storage_get=lambda path: copy.deepcopy(records.get(path)), storage_put=put,
       telegram=telegram, dispatch_update=action, acknowledge_received_callback=ack,
       request_json=lambda path: {'runtime_dir': 'old'}, now=lambda: 'now',
@@ -53,7 +56,7 @@ class ListenerTests(unittest.TestCase):
     )
     return b, records, writes, handled, cursors, acks
 
-  def test_navigation_address_is_reread_for_each_action(self):
+  def test_navigation_uses_job_context_not_untrusted_storage_address(self):
     seen=[]
     b,records,*_=self.fixture(batches=[[{'update_id':1,'message':{'text':'hello'}},{'update_id':2,'message':{'text':'again'}}]])
     records['settings.json']['mobiusAddress']='https://first.example'
@@ -61,8 +64,8 @@ class ListenerTests(unittest.TestCase):
       seen.append(origin)
       records['settings.json']['mobiusAddress']='https://second.example'
     b.dispatch_update=action
-    run_listener(b,{}, {'runtime_dir':'old'}, 'fixture_bot')
-    self.assertEqual(seen,['https://first.example','https://second.example'])
+    run_listener(b,{}, {'runtime_dir':'old','public_origin':'https://accepted.example'}, 'fixture_bot')
+    self.assertEqual(seen,['https://accepted.example','https://accepted.example'])
 
   def test_intake_and_navigation_continue_during_slow_reply(self):
     release = threading.Event()
@@ -173,7 +176,7 @@ class ListenerTests(unittest.TestCase):
     started = threading.Event()
     release = threading.Event()
     menu = threading.Event()
-    update = {'update_id': 1, 'callback_query': {'data': 'cmd:settings', 'from': {'id': 7}, 'message': {'chat': {'id': 99}}}}
+    update = {'update_id': 1, 'callback_query': {'data': 'cmd:settings', 'from': {'id': 99}, 'message': {'chat': {'id': 99}}}}
     def dispatch(update, records):
       self.assertTrue(update['_callback_ack_delegated'])
       self.assertTrue(started.wait(1))
@@ -219,7 +222,7 @@ class ListenerTests(unittest.TestCase):
     def dispatch(update, records):
       handled.append(update.get('_callback_ack_delegated', False))
       if len(handled) == 2:release.set()
-    batches = [[{'update_id': i, 'callback_query': {'data': 'cmd:settings', 'from': {'id': 7}, 'message': {'chat': {'id': 99}}}} for i in (1, 2)]]
+    batches = [[{'update_id': i, 'callback_query': {'data': 'cmd:settings', 'from': {'id': 99}, 'message': {'chat': {'id': 99}}}} for i in (1, 2)]]
     b, *_ = self.fixture(batches, dispatch)
     original = b.acknowledge_received_callback
     def ack(update, pairing):
@@ -228,7 +231,50 @@ class ListenerTests(unittest.TestCase):
     try:
       with patch('bridge_loop.MAX_PENDING', 20):
         # Poll batch capacity is20; fill its ack capacity using the same fixture.
-        batches[0].extend({'update_id': i, 'callback_query': {'data': 'cmd:settings', 'from': {'id': 7}, 'message': {'chat': {'id': 99}}}} for i in range(3, 22))
+        batches[0].extend({'update_id': i, 'callback_query': {'data': 'cmd:settings', 'from': {'id': 99}, 'message': {'chat': {'id': 99}}}} for i in range(3, 22))
         run_listener(b, {}, {'runtime_dir': 'old'}, 'bot')
     finally:release.set()
     self.assertEqual(handled, [True]*20+[False])
+
+
+def test_intake_never_persists_credential_looking_plaintext():
+  key='123456:'+('A'*40)
+  fixture=ListenerTests()
+  update={'update_id':1,'message':{'chat':{'id':99,'type':'private'},'from':{'id':99},'text':key}}
+  b,records,writes,handled,cursors,acks=fixture.fixture([[update]])
+  run_listener(b,{}, {'runtime_dir':'old'}, 'synthetic_bot')
+  import json
+  assert key not in json.dumps(writes)
+
+
+def test_rejected_receipt_is_durable_before_receive_cursor_and_ordered():
+  key='123456:'+('A'*40)
+  fixture=ListenerTests();seen=[]
+  first={'update_id':1,'message':{'text':'ordinary'}}
+  reject={'update_id':2,'message':{'chat':{'id':99,'type':'private','title':key},'from':{'id':99,'first_name':key},'date':7,'message_id':8,'text':key,'reply_to_message':{'text':key}}}
+  third={'update_id':3,'message':{'text':'after'}}
+  b,records,writes,handled,cursors,acks=fixture.fixture([[first,reject,third]])
+  def dispatch(update,settings,pairing,origin):seen.append(copy.deepcopy(update))
+  b.dispatch_update=dispatch
+  run_listener(b,{}, {'runtime_dir':'old'}, 'synthetic_bot')
+  assert [u['update_id'] for u in seen]==[1,2,3]
+  receipt=seen[1]
+  assert receipt=={'update_id':2,'_bridge_rejected_input':True,'message':{'chat':{'id':99,'type':'private'},'from':{'id':99},'date':7,'message_id':8}}
+  initial=next(value for path,value in writes if path==INBOX_PATH)
+  assert initial['updates'][1]==receipt
+  first_inbox=next(i for i,(p,v) in enumerate(writes) if p==INBOX_PATH)
+  cursor_write=next(i for i,(p,v) in enumerate(writes) if p=='bridge-runtime.json' and v.get('offset')==4)
+  assert first_inbox<cursor_write and 4 in cursors
+  assert records[INBOX_PATH]['updates']==[]
+
+
+def test_admission_does_not_persist_nested_quoted_key_or_caption():
+  from bridge_loop import admit_update,responsive_control
+  key='123456:'+('A'*40)
+  import json
+  for extra in ({'reply_to_message':{'text':key}}, {'caption':key}, {'forward_origin':{'sender_user':{'first_name':key}}}):
+    update={'update_id':1,'message':{'chat':{'id':99,'type':'private'},'from':{'id':99},'text':'/menu',**extra}}
+    projected=admit_update(update)
+    assert key not in json.dumps(projected)
+    assert projected['_bridge_rejected_input'] is True
+    assert not responsive_control(projected)

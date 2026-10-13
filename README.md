@@ -1,130 +1,88 @@
-# Telegram Bridge
+# Telegram Bridge · public-core edition
 
-Your personal Möbius owner agent in a paired private Telegram chat. Telegram
-transport and conversation handling live in this app, not a platform Telegram proxy.
+A dedicated private Telegram bot is your owner remote for **Bridge-created**
+Möbius conversations. Chats, Bots and Tools retain the current Bridge visual
+language. This edition uses supported public core contracts at
+`9ebca6c8584400e6adc419ee8196a0fb82d19896`; no core patch is required.
+Review COMPATIBILITY.md before upgrading another edition: unsupported features are not migrated.
 
-> **Platform requirement:** use Möbius with the supervised-job secret permission
-> added in [PR #1565](https://github.com/mobius-os/mobius/pull/1565). It is included
-> in official image revision `928fef19ebabc7023375a748f0c8718831cb5605`
-> (published 29 September 2026), or a later compatible revision. Update Möbius
-> before connecting a bot; older versions cannot run these jobs.
-> No Telegram proxy, new confirmation system or service-concurrency change is required.
+## Secure first-time setup
 
-## Two companion apps
+1. Create a dedicated bot with BotFather. Do not reuse a running specialist bot
+   or a bot with a webhook. Installation grants nothing in Studio.
+2. Settings → **Set up securely in Möbius** opens an editable owner-chat draft,
+   not an action, approval, credential input or transcript transfer. Send it in
+   your ordinary nondelegated owner chat if you want to connect.
+3. The owner agent resolves this numeric app's accepted `job-context.runtime_dir`
+   and runs its accepted `owner.py connect --app-id <id>` with the platform
+   Python environment. The helper verifies current app identity/nonce/runtime
+   and saves the public existing sealed-input form **as the final turn action**.
+   End that owner-chat turn on its saved receipt, without more text/tools.
+   Do not run this helper from editable source, a job, a service or a child chat.
+4. Enter the BotFather key only into that saved trusted form. Its narrow consumer
+   verifies `getMe` and `getWebhookInfo`, encrypts the key via this app's secret
+   API, and records only safe bot identity metadata. It never starts a job,
+   changes pairing, clears a webhook or sends a message. An existing installation
+   cannot silently switch to a different bot. No token is printed, logged,
+   copied into arguments/environment, or shown to the app frame/model.
+5. Prepare the one-time pairing code in Settings, then explicitly **Enable
+   listening**. The supervisor/cron owns one listener. Send the visible pairing
+   command to your personal bot. Only the first matching private account is
+   paired; its code is consumed. Other accounts/groups are ignored. A paired
+   owner's ordinary text can incur configured provider usage.
 
-- **Telegram Bridge** works on its own: pair one private Telegram account, create
-  app-owned conversations, choose models and answer saved Möbius questions.
-- **Telegram Bot Studio** is a separate app for building, privately testing and
-  publishing specialist bots. **Pair Bridge first**, then connect a different bot
-  in Studio. Studio uses the pairing to verify the owner's Telegram identity.
-- Specialist participants never receive the owner agent. Their notes and
-  conversations stay separate. Installation alone grants no cross-app access.
+The consumer is tied to the exact saved card in `consuming` state, its canonical
+public request identity and non-guest/nondelegated originating owner run, its current
+chat, accepted runtime, app nonce and reviewed `job_secret_read: [bot-token]`
+contract. It mints only a two-minute **ordinary own-app** credential
+through existing public auth primitives, with no owner, service or job claims. No general
+owner token file is used. Submitted values only enter the intended Telegram API
+check and encrypted app-secret destination. Setup runs only after you submit the sealed owner form.
 
-Catalog navigation is a separately approved metadata-only connection. User
-management alone lists only the published bots covered by that narrower grant. Optional
-**Enable user management** covers access requests and alerts for current and
-future published Studio bots owned by the paired account. It does not expose
-participant content or authorize publication, bot activation or model changes.
-Customization opens in Möbius; continuing pre-existing owner chats from Telegram
-and direct whole-shell screenshot shortcuts are not included in this Store edition.
+## Use
 
-Studio's display name was formerly Assistant Studio. Its `assistant-studio`
-package/service identity is stable; app names and source folder names are not IDs.
+- Send ordinary text for a reply. `/menu`, `/chats`, `/new`, `/model`, `/status`,
+  `/bots`, and `/bridge` provide native navigation. Read menus remain responsive
+  while ordered owner work runs. Message batches persist before receive-cursor
+  advancement. Model changes create a new chat; old conversations stay saved.
+- `/chats` reads only fresh Bridge-owned metadata. Review a conversation and
+  explicitly **Continue here** to route the next message. Opening it in Möbius
+  does not change the Telegram destination. Archive state is not publicly
+  exposed, so this edition never labels the list Active/Archived.
+- Exact ordinary saved cards preserve canonical question/option IDs, prompt
+  strings and labels. Oversized, unsupported, secure-input and typed platform
+  cards link to Möbius. Telegram answers are **agent-scoped input**, never proof
+  of trusted owner approval. Sensitive authority remains in Möbius.
+- Optional Studio metadata is read only through its already-authorized service,
+  checked against `owner-metadata-v1`, fresh numeric app identity and accepted runtime metadata.
+  Missing/restricted/mismatched Studio does not impair personal Bridge. Bot
+  navigation does not install, connect, activate, publish or grant chat access.
+- Pause stops future intake; already accepted work or in-flight delivery may
+  finish. Revocation/replacement needs explicit owner-chat review. No pairing,
+  key, grant or participant data is automatically imported into this edition.
 
-## Setup
+## Honest recovery and privacy
 
-1. Create a dedicated bot in BotFather, not one already connected to another app.
-2. Choose **Connect securely** and send the prepared request in Möbius chat. Enter
-   the key only in that chat's sealed card, never as a chat message. The consumer
-   verifies the bot, refuses an existing webhook, encrypts the key and starts
-   listening if Bridge is enabled. It never removes a webhook automatically.
-3. Send the displayed pairing command from your private Telegram account. The
-   first valid private account is paired; other accounts cannot use your agent.
-4. In **Settings → Möbius address**, save the installation's HTTPS origin without
-   paths, credentials or query parameters. It is used only in navigation buttons,
-   never for credentialed requests. Blank disables links, not text replies.
+Requests are pinned to the accepted conversation and CID before submission.
+Unknown message/answer submission is never rerouted or automatically retried.
+Telegram sends are reserved durably before transport; a missing delivery
+acknowledgment is uncertain, not safe to resend. Completed duplicate recovery
+links to Möbius instead of reading owner-only transcripts or rerunning work.
+Queued messages and answer turns without new work link to Möbius rather than
+consume a different turn's stream. A stream ending or `running: false` is not
+proof that work, a Goal, or a privileged action succeeded.
 
-Generated images stay in the authenticated Möbius conversation. Telegram receives
-text plus **Open in Möbius**, without media-access keys. A normal sign-in is still
-required. Neither image files nor owner credentials are sent with those links.
+The reviewed background job reads its own encrypted bot key into **RAM only**
+for a fixed HTTPS Telegram origin and a canonical method allowlist. Browser
+frames cannot decrypt keys; no service is declared by Bridge. No redirect,
+proxy environment, credential echo or raw exception is forwarded to the frame.
+Telegram processes Telegram requests; configured providers process Möbius
+requests. Hosting operators control the machine; this is not encryption from
+its operator. Store/source packages contain no keys, pairings or histories.
 
-## Using Bridge
+Only Python's standard library is needed by listener/transport. The explicitly
+owner-invoked sealed setup helper uses the deployed platform Python and existing
+public backend primitives, not ambient provider packages or CLI credentials.
+Keep the existing MIT attribution in `LICENSE`; dependency and third-party notices retain their own terms.
 
-Telegram's native menu offers Chats, My bots, Settings and Help. `/new` creates a
-fresh Bridge-owned conversation. `/model` changes the model for new conversations;
-`/status` shows connection state. Routine replies have no navigation footer.
-Saved questions use compact buttons and typed alternatives; stale controls retire
-when answered in Möbius. UI-only or unsupported cards link back to Möbius.
-
-Model replies use your owner agent and may incur usage. Menu navigation does not
-call a model. Pausing retains pending work; revoking pairing stops future access.
-In-flight external requests can finish. A fresh pairing never grants access to
-pre-existing owner chats or specialist participant content.
-
-## Runtime and privacy
-
-The existing supervised app job owns polling and bounded worker lanes. Intake is
-saved before the Telegram cursor advances. One ordered worker handles conversation
-mutations while read-only controls and acknowledgements remain responsive. App-owned
-locks protect shared status/connection writes. Platform service limits stay unchanged.
-
-Message submission has an update-derived idempotency key. Telegram sends do not:
-a crash after delivery can still repeat a Bridge reply. Do not claim exactly-once
-external delivery. Cosmetic response drafts contain public reply text, not reasoning
-or tool results; failure never prevents the final response.
-
-The job may read only its declared `bot-token` from the encrypted own-app secret
-store. The browser receives no key or raw Telegram response. Keys are not cached
-between calls. A compromised approved job could leak its permitted key; revocation
-cannot retract one already read. Trusted app code is not an OS sandbox.
-
-Studio access management uses live pairing/grant checks and exact-user state reviews.
-Disconnect keeps users' existing access/content but stops future delegated management.
-Notification receipts fence uncertain sends; the Users list is the recovery path.
-No notes, conversations, sessions, models or billing are exposed by that grant.
-
-## Owner chat setup and confirmations
-
-Sensitive app buttons prepare editable Möbius chat requests. The owner sends
-them; clicking a button is not approval and never sends a model turn. Treat the
-JSON selection as data. Resolve the numeric app ID and service identity first.
-
-For key setup/replacement, run `python3 <source_dir>/owner.py connect --app-id <id>`
-as the turn's final action. It opens the existing sealed-input card. The card
-explains that a dedicated bot is verified, the key encrypted, the paired account
-retained and the normal listener started if enabled. The key never enters the
-chat transcript, model, app frame or action arguments. Do not execute the sealed
-consumer yourself or ask for keys in chat.
-
-For connect-access/disconnect-access, inspect the current pairing and grant.
-Explain that connection covers user access and request alerts for current AND
-future Studio bots owned by the paired account, but no participant content.
-Allowing users can send notices and incur usage. Disconnection keeps existing
-user access unchanged; in-flight operations may finish. Obtain one exact saved
-approval with pairing user/chat/date or the current grant. After approval only,
-pass the reviewed `{ "action": "connect-access", "context": {...} }` (or
-disconnect-access) on stdin to `python3 <source_dir>/owner.py execute --app-id <id>`.
-The helper checks the live pairing and serializes mapping changes. Changed state
-requires a new review, not silently replacing the approved selection. Decline
-changes nothing. Jobs and app frames cannot use this owner helper.
-
-## Verification and license
-
-Run `python3 -m pytest -q` from this repository. Tests use synthetic data and fake
-Telegram/Möbius responses, not live messages or paid model calls. See
-[TESTING.md](TESTING.md) for isolated browser fixtures. Never run those fixtures
-against an installed app. Native Telegram client behavior needs separate testing.
-
-MIT; see [LICENSE](LICENSE). Runtime UI dependencies come from Möbius, not vendored
-archives. Telegram is a third-party service; this is not an official Telegram
-product. Store screenshots use synthetic data. No keys, runtime state or private
-chat history are included in this source-only package.
-
-### Optional catalog navigation
-
-To list draft/setup metadata and editing-chat links in Bridge, request a separate
-saved approval naming the exact installed Bridge app ID and this metadata-only
-scope. In an owner chat, call Studio's owner helper with
-`call('owner/navigation', {'app_id': <reviewed-Bridge-id>})` only after approval.
-This is not needed for the narrower published-bot user-management list. No
-participant data, chat transcript, activation or publication authority is shared.
+See [COMPATIBILITY.md](COMPATIBILITY.md) for the exact feature matrix. See TESTING.md for the repeatable synthetic suite.
